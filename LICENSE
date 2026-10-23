@@ -1,0 +1,124 @@
+# 艺镜 Studio 非商业许可协议 1.0
+
+**YiJing Studio Non-Commercial License 1.0**
+
+版权所有 (c) 2026 艺镜 Studio 作者。保留所有权利。
+
+> 本协议同时提供中文与英文版本。两者如有冲突，以**中文版本**为准。
+> This license is provided in Chinese and English. In case of conflict, the **Chinese version prevails**.
+
+---
+
+## 一、定义
+
+1. **「本软件」** 指本仓库内以任何形式存在的全部内容，包括但不限于
+   `app/` 目录下的混淆构建产物（`dist/`、`dist-electron/`）、本地推理服务脚本
+   （`app/deploy/`）、图标、文档、截图，以及后续版本、更新与补丁。
+2. **「商业用途」** 指任何以获取经济利益为目的，或发生在商业组织内部生产环境中的使用，
+   包括但不限于：
+   - 用于生产对客户交付的内容、产品或服务；
+   - 集成进任何收费或附带商业推广的产品；
+   - 以 SaaS、API、托管服务等形式向第三方提供其功能；
+   - 用于企业内部日常经营（含外包、代运营、广告、电商、影视制作等业务）；
+   - 二次销售、出租、按次计费，或以本软件为基础提供付费培训与咨询服务。
+3. **「模型权重」** 指本软件运行所依赖的第三方人工智能模型文件。模型权重不包含在本软件内，
+   不适用本协议。
+
+## 二、授权范围
+
+在遵守本协议全部条款的前提下，作者授予你一项**非独占、不可转让、可撤销、免费**的许可，
+允许你：
+
+1. 下载、安装、运行本软件；
+2. 用于**个人学习、技术研究、教学演示、功能评估**；
+3. 用于**非商业的个人创作**（包括发布到个人社交账号、参加不设商业报酬的比赛、
+   非营利的公益宣传）；
+4. 为学习与研究目的阅读、分析混淆后的构建产物；
+5. 在**完整保留本协议与版权声明**的前提下，原样转发未修改的安装包。
+
+## 三、限制
+
+除非事先取得作者的书面授权，你**不得**：
+
+1. **将本软件用于任何商业用途**（定义见第一条第二款）；
+2. 对本软件的混淆产物进行反混淆、逆向工程后，将还原出的源代码全部或部分公开、
+   分发、销售或用于训练其他模型；
+3. 修改、翻译、演绎本软件后分发修改版本；
+4. 移除、隐藏或篡改本软件中的版权声明、作者标识、许可提示；
+5. 将本软件或其衍生品以任何名义重新命名后发布，使他人误以为是独立作品；
+6. 绕过本软件「仅调用本机模型」的限制，或将本软件改造成转发云端 API 的客户端后分发。
+
+## 四、模型权重的独立许可
+
+本软件依赖的对话、图像、视频、语音、超分模型由第三方提供，各自适用其原始许可协议。
+作者不对这些模型的许可合规性作任何保证。你**必须自行**确认并遵守：
+
+- 模型的使用范围（是否允许商用、是否允许再分发、是否允许生成特定内容）；
+- 模型生成内容的使用限制；
+- 模型来源平台的服务条款。
+
+模型许可与本协议相互独立。**即使你获得了本软件的商用授权，也不代表你获得了模型的商用授权。**
+
+## 五、生成内容
+
+1. 你对使用本软件生成的内容自行承担责任。
+2. 你须确保输入素材（图片、视频、音频、文本、人物肖像）拥有合法使用权，
+   生成结果不侵犯他人肖像权、名誉权、著作权、商标权或其他权利。
+3. 不得使用本软件生成违反所在地法律法规的内容，包括但不限于违法信息、
+   侵害未成年人权益的内容、虚假信息、侵权内容。
+
+## 六、无担保
+
+本软件按**「现状」**提供，不附带任何明示或默示的担保，包括但不限于适销性、
+特定用途适用性、权利无瑕疵和不侵权的担保。
+
+在任何情况下，作者均不对因使用或无法使用本软件而产生的任何直接、间接、偶然、
+特殊、惩罚性或后果性损害承担责任，包括但不限于利润损失、数据丢失、业务中断、
+设备损坏，即使作者已被告知此类损害的可能性。
+
+## 七、终止
+
+1. 你违反本协议任一条款时，本协议授予的全部权利**立即自动终止**，无需作者另行通知。
+2. 协议终止后，你必须在 7 日内停止使用并删除本软件的全部副本。
+3. 协议终止不影响作者就违约行为追究责任的权利。
+
+## 八、商用授权
+
+如需商业使用，须取得作者的书面授权。请在仓库 Issue 中说明使用场景、规模与期限，
+作者将根据实际情况提供单独的商业许可协议。
+
+## 九、适用法律
+
+本协议适用中华人民共和国法律。因本协议产生的争议，双方应友好协商解决；
+协商不成的，提交作者所在地有管辖权的人民法院解决。
+
+---
+
+## English Summary (Non-binding)
+
+**YiJing Studio is NOT open source in the OSI sense. It is source-available under a
+non-commercial license.**
+
+You MAY: use it for personal learning, research, evaluation, and non-commercial
+personal creation; read the obfuscated build for study; redistribute the unmodified
+installer together with this license.
+
+You MAY NOT: use it for any commercial purpose (including internal business
+production, client work, SaaS, bundling into paid products, resale); deobfuscate and
+publish the recovered source; distribute modified versions; remove copyright notices;
+or repackage it under another name.
+
+Model weights are licensed separately by their original providers and are **not**
+covered by this license. A commercial license for this software does **not** grant
+any rights to the models.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. THE AUTHOR SHALL NOT
+BE LIABLE FOR ANY DAMAGES ARISING FROM THE USE OF THIS SOFTWARE.
+
+Any violation terminates all rights granted here immediately.
+
+For commercial licensing, please open an Issue in this repository.
+
+---
+
+Copyright (c) 2026 YiJing Studio Authors. All rights reserved.

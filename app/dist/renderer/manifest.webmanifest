@@ -1,0 +1,17 @@
+{
+  "name": "艺镜AI无限画布",
+  "short_name": "艺镜AI",
+  "description": "文本、图片、视频一体的 AI 创作画布",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#12101c",
+  "theme_color": "#12101c",
+  "lang": "zh-CN",
+  "icons": [
+    { "src": "/yjai-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/yjai-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png" }
+  ]
+}

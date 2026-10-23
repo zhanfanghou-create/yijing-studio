@@ -1,0 +1,9 @@
+# 统一用 LF：app/deploy 下是 bash 脚本，CRLF 会让它在 Linux 上直接跑不起来
+* text=auto eol=lf
+
+# 二进制：不要做任何换行符处理
+*.png binary
+*.ico binary
+*.jpg binary
+*.exe binary
+*.blockmap binary
