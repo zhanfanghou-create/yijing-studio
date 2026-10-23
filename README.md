@@ -234,15 +234,15 @@ Windows 桌面端 · Electron + React + React Flow · 全部模型跑在本机�
 git clone https://github.com/zhanfanghou-create/yijing-studio.git
 cd yijing-studio/app
 
-# 需要 Node 18+ 和一个 Electron 44
-npm init -y
-npm i -D electron@44
-
+# app/package.json 里已经声明了 electron 依赖，直接装
+npm install          # 首次会下载 Electron 运行时，约 100MB
 npx electron .
 ```
 
 `app/package.json` 里的入口指向 `dist-electron/electron/main.js`，
 渲染层在 `dist/renderer/`，两者都是 vite / tsc 的产物经 `javascript-obfuscator` 处理后的结果。
+
+> 没有 `git` 也可以：在仓库页面点 `Code → Download ZIP` 解压，同样进 `app/` 目录跑上面两条命令。
 
 > 如果只是想「用」，请用安装包。这一节是给想审计运行行为、或想验证构建产物一致性的人准备的。
 
