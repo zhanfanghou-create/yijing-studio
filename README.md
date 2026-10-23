@@ -216,7 +216,7 @@ Windows 桌面端 · Electron + React + React Flow · 全部模型跑在本机�
 
 ### 方式一：装安装包（推荐）
 
-从 [Releases](../../releases) 下载 `YijingStudio-0.1.0-win-x64.exe`，双击安装。
+从 [Releases](https://github.com/zhanfanghou-create/yijing-studio/releases) 下载 `YijingStudio-0.1.0-win-x64.exe`，双击安装。
 
 - 安装向导可改安装目录，会建桌面快捷方式和开始菜单项
 - 首次启动会引导你做一次**配置检测**，缺什么补什么
@@ -369,7 +369,7 @@ npm run dist:win     # electron-builder → NSIS 安装包
 ```
 
 安装包不在版本库里（单文件 112MB，超过 GitHub 单文件 100MB 上限），
-挂在 [Releases](../../releases)。
+挂在 [Releases](https://github.com/zhanfanghou-create/yijing-studio/releases)。
 
 ---
 
