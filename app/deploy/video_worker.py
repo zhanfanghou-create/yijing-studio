@@ -234,51 +234,6 @@ def h3_cmd(args, w, h, out_dir, status):
     return out
 
 
-# ---------------------------------------------------------------- Wan（快档）
-
-def run_wan(args, w, h, out_dir, status, tick):
-    import torch
-    from diffusers import DiffusionPipeline
-    from diffusers.utils import export_to_video
-
-    fps = 16
-    frames = max(17, int(round(args.duration * fps / 4)) * 4 + 1)
-
-    write_status(status, status="processing", progress=0.08, message="加载 Wan 权重")
-    pipe = DiffusionPipeline.from_pretrained(args.model, torch_dtype=torch.bfloat16)
-    if os.environ.get("YJ_VIDEO_OFFLOAD") == "1":
-        pipe.enable_model_cpu_offload()
-    else:
-        pipe.to("cuda")
-    try:
-        pipe.set_progress_bar_config(disable=True)
-    except Exception:
-        pass
-
-    steps = args.steps or 30
-    kwargs = dict(prompt=args.prompt, num_frames=frames, width=w, height=h,
-                  num_inference_steps=steps, guidance_scale=5.0,
-                  callback_on_step_end=tick)
-    if args.image:
-        try:
-            result = pipe(image=args.image[0], **kwargs)
-        except TypeError:
-            from diffusers import WanImageToVideoPipeline  # noqa: PLC0415
-
-            del pipe
-            torch.cuda.empty_cache()
-            pipe = WanImageToVideoPipeline.from_pretrained(
-                args.model, torch_dtype=torch.bfloat16
-            ).to("cuda")
-            result = pipe(image=args.image[0], **kwargs)
-    else:
-        result = pipe(**kwargs)
-
-    dest = out_dir / f"vid_{args.job}.mp4"
-    export_to_video(result.frames[0], str(dest), fps=fps)
-    return dest
-
-
 # ---------------------------------------------------------------- 合流
 
 def mux_audio(video_path: Path, audio, out_path: Path):
@@ -368,12 +323,17 @@ def main():
 
         backend = args.backend
         if backend == "auto":
-            backend = "diffusers" if h3 else "wan"
+            backend = "diffusers"
 
         dest = out_dir / f"vid_{args.job}.mp4"
 
         if not h3:
-            dest = run_wan(args, w, h, out_dir, status, tick)
+            # 这里以前会退到 Wan 出片（小显存机器的降级档）。产品上明确只要 H3，
+            # 所以不再降级：「悄悄换个模型给你出片」比「直说这个模型不支持」有害得多 ——
+            # 用户会以为自己用的是 H3，实际拿到的是 5B 的效果。
+            raise RuntimeError(
+                f"视频只支持 MiniMax H3，收到 {args.model!r}。其他视频后端已从这条链路移除。"
+            )
         elif backend == "sglang":
             url, _audio = h3_sglang(args, w, h, status)
             import urllib.request
@@ -389,10 +349,12 @@ def main():
             if backend == "diffsynth":
                 tries = [("diffsynth", lambda: h3_diffsynth(args, w, h, status, tick))]
             else:
-                tries = [
-                    ("diffusers", lambda: h3_diffusers(args, w, h, frames, status, tick)),
-                    ("diffsynth", lambda: h3_diffsynth(args, w, h, status, tick)),
-                ]
+                # 目录名带 nf4 就是 DiffSynth 的量化包（扁平结构，没有 model_index.json）。
+                # 那种目录 diffusers 的 from_pretrained 注定读不了，先试它只是白等一轮报错，
+                # 所以按「这份权重是什么形态」决定顺序，而不是固定先 diffusers。
+                _d = ("diffsynth", lambda: h3_diffsynth(args, w, h, status, tick))
+                _f = ("diffusers", lambda: h3_diffusers(args, w, h, frames, status, tick))
+                tries = [_d, _f] if "nf4" in str(args.model).lower() else [_f, _d]
 
             video_audio, errors = None, []
             for name, run in tries:

@@ -37,8 +37,7 @@
     YJ_IMAGE_STEPS     默认 28（官方标准 40 步，28 步在 2K 下质量已很难分辨）
     YJ_IMAGE_MAX_SIDE  默认 1536；设 2752 才出原生 2K（慢 3-4 倍）
     YJ_IMAGE_OFFLOAD   默认 1（CPU offload 换显存，必须开，否则和语音抢不过来）
-    YJ_VIDEO_MODEL     默认 MiniMaxAI/MiniMax-H3
-    YJ_VIDEO_FAST_MODEL 默认 Wan-AI/Wan2.2-TI2V-5B（请求里 model=fast 时用）
+    YJ_VIDEO_MODEL     默认 MiniMaxAI/MiniMax-H3（**视频只有这一个后端**）
     YJ_VIDEO_BACKEND   auto | diffusers | diffsynth | sglang | cmd
     YJ_MODE            full | image | text（只开某几个模态，省显存）
 """
@@ -66,12 +65,14 @@ TEXT_UPSTREAM = os.environ.get("YJ_TEXT_UPSTREAM", "http://127.0.0.1:8001/v1").r
 VOICE_BASE = os.environ.get("YJ_VOICE_BASE", "http://127.0.0.1:3910").rstrip("/")
 IMAGE_MODEL = os.environ.get("YJ_IMAGE_MODEL", "Qwen/Qwen-Image-2.1")
 VIDEO_MODEL = os.environ.get("YJ_VIDEO_MODEL", "MiniMaxAI/MiniMax-H3")
-VIDEO_FAST = os.environ.get("YJ_VIDEO_FAST_MODEL", "Wan-AI/Wan2.2-TI2V-5B")
-# 「没指定 model 时用哪个」和「H3 是哪个」是两件事，必须能分开配。
-# 实测：H3-Base 光权重就 ~125 GB bf16（DiT 62 GB + Qwen3-VL 文本编码器 63 GB），
-# 4090D 的 48 GB 显存必须全量 CPU offload，120 GB 内存也刚好卡在边缘；
-# 而且它的 model_index 是老格式，还要求 transformers 里有 MiniMaxH3Qwen3VLHFEncoder。
-# 所以小机器上把默认档指向能跑的那个（Wan 5B），H3 用 model=h3 显式点名。
+# 视频**只有 H3 一个后端**。以前这里有第二个档（Wan2.2-TI2V-5B，作为小显存机器的
+# 降级），产品上明确不要了：与其维护两套采样参数、两套帧率（H3 24fps / Wan 16fps）、
+# 两套尺寸归一化，不如只留一条链路，硬件不够就直说硬件不够。
+#
+# H3 的真实胃口（实测）：bf16 权重 125 GB（DiT 62 + Qwen3-VL 编码器 63），
+# 官方 NF4 版约 42 GB 但仍需 30–36 GB 显存。也就是说**单卡 24 GB 跑不了**，
+# 48 GB 是起步线。显存不够时这里不会静默降级到别的模型，而是让请求失败 ——
+# 「悄悄换了个模型出片」比「直接告诉我不够」有害得多。
 VIDEO_DEFAULT = os.environ.get("YJ_VIDEO_DEFAULT", VIDEO_MODEL)
 VIDEO_BACKEND = os.environ.get("YJ_VIDEO_BACKEND", "auto")
 IMAGE_STEPS = int(os.environ.get("YJ_IMAGE_STEPS", "28"))
@@ -410,6 +411,21 @@ def _has_alpha(img):
 
 # ============================================================== 视频：MiniMax H3
 
+def _worker_path():
+    """视频 worker 的入口文件。
+
+    `init.sh` 的部署流程会把 `.py` 编译成 `.pyc` 再删掉源码（源码保护），
+    所以这里**不能写死 `video_worker.py`** —— 线上那个文件根本不存在，
+    `Popen` 会直接 `No such file`，表现为「提交成功、任务永远 queued」。
+    `.pyc` 可以直接交给 python 执行（CPython 认这个入口）。
+    """
+    for name in ("video_worker.py", "video_worker.pyc"):
+        p = ROOT / name
+        if p.is_file():
+            return str(p)
+    return str(ROOT / "video_worker.py")
+
+
 def submit_video(body):
     job_id = uuid.uuid4().hex[:12]
     status_file = STATUS / f"{job_id}.json"
@@ -418,17 +434,13 @@ def submit_video(body):
     )
 
     alias = {
-        "fast": VIDEO_FAST, "wan": VIDEO_FAST, "quick": VIDEO_FAST, "turbo": VIDEO_FAST,
-        "wan2.2": VIDEO_FAST, "wan2.2-ti2v-5b": VIDEO_FAST, "video-fast": VIDEO_FAST,
-        "wan-fast": VIDEO_FAST, "wan_fast": VIDEO_FAST,
         "h3": VIDEO_MODEL, "minimax": VIDEO_MODEL, "minimax-h3": VIDEO_MODEL,
         "minimax-h3-base": VIDEO_MODEL, "h3-base": VIDEO_MODEL, "video": VIDEO_MODEL,
     }
     model = _resolve_repo(body.get("model"), VIDEO_DEFAULT, alias)
-    fast = model == VIDEO_FAST
 
     args = [
-        sys.executable, str(ROOT / "video_worker.py"),
+        sys.executable, _worker_path(),
         "--job", job_id, "--status", str(status_file), "--out", str(OUT),
         "--port", str(PORT), "--model", model,
         "--prompt", body.get("prompt") or "",
@@ -546,6 +558,31 @@ def _probe(url):
         return "down"
 
 
+def _has_weights(path_str):
+    """权重目录能不能被加载器认出来。
+
+    判据取「入口清单文件」，命中任意一个即可：
+      · `model_index.json`  —— diffusers 管线（图片全部、H3 官方全量）
+      · `configuration.json` —— DiffSynth 的 NF4 量化版（H3 默认下的就是这份，扁平结构）
+
+    只认死 `model_index.json` 的话，H3-NF4 装齐了也会被报成 missing —— 这和以前
+    「脚本文件存在性」那类错是同一个毛病：**拿实现细节当能力判据**。
+
+    不在 healthz 里 stat 全部分片 —— 这个端点被 run.sh 每 0.5 秒轮询一次，
+    在 webdav 上逐个 stat 几十 G 的分片会把存活探针拖死。
+    """
+    try:
+        p = Path(str(path_str))
+        if not p.is_dir():
+            return False
+        if (p / "model_index.json").is_file() or (p / "configuration.json").is_file():
+            return True
+        # H3 官方 diffusers 仓库：入口在 FL2VA 分区里
+        return (p / "FL2VA" / "model_index.json").is_file()
+    except Exception:
+        return False
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "yj-model-server/2.0"
@@ -577,14 +614,23 @@ class Handler(BaseHTTPRequestHandler):
             caps = {
                 "text": _probe(TEXT_UPSTREAM + "/models"),
                 "voice": _probe(VOICE_BASE + "/healthz"),
-                "image": "ready",
-                "video": "ready" if (ROOT / "video_worker.py").exists() else "missing",
+                # 图片 / 视频按**默认档的权重目录**判，不看脚本文件在不在。
+                #
+                # 以前这里写的是 (ROOT / "video_worker.py").exists()，而 init.sh 的
+                # 部署流程会把 .py 编译成 .pyc 再删源码 —— 于是线上永远报
+                # video: missing，明明 H3 权重齐着、也能出片。用「脚本文件存在性」
+                # 判能力本身就是脆的：文件在也不代表权重在。
+                # image 以前直接写死 "ready"，同理改成真看目录。
+                "image": "ready" if _has_weights(IMAGE_MODEL) else "missing",
+                "video": "ready" if (
+                    _has_weights(VIDEO_DEFAULT) or _has_weights(VIDEO_MODEL)
+                ) else "missing",
             }
             return self._json(200, {
                 "ok": True, "mode": MODE, "caps": caps, "vram": LEASE.stats(),
                 "models": {
                     "image": IMAGE_MODEL, "video": VIDEO_MODEL,
-                    "video_fast": VIDEO_FAST, "video_default": VIDEO_DEFAULT,
+                    "video_default": VIDEO_DEFAULT,
                     "image_steps": IMAGE_STEPS,
                     "image_max_side": IMAGE_MAX_SIDE, "image_offload": IMAGE_OFFLOAD,
                 },
@@ -596,7 +642,6 @@ class Handler(BaseHTTPRequestHandler):
                 "data": [
                     {"id": IMAGE_MODEL, "object": "model", "owned_by": "local", "kind": "image"},
                     {"id": VIDEO_MODEL, "object": "model", "owned_by": "local", "kind": "video"},
-                    {"id": VIDEO_FAST, "object": "model", "owned_by": "local", "kind": "video"},
                     {"id": os.environ.get("YJ_TEXT_MODEL", "Qwen3-8B-Instruct"),
                      "object": "model", "owned_by": "local", "kind": "chat"},
                 ],
@@ -720,7 +765,7 @@ def main():
     log(f"产物目录 {OUT}")
     log(f"文本 {TEXT_UPSTREAM} / 语音 {VOICE_BASE}")
     log(f"图片 {IMAGE_MODEL}（{IMAGE_STEPS} 步 / 长边 {IMAGE_MAX_SIDE}px / offload={IMAGE_OFFLOAD}）")
-    log(f"视频 {VIDEO_MODEL}（快档 {VIDEO_FAST}，backend={VIDEO_BACKEND}）")
+    log(f"视频 {VIDEO_MODEL}（backend={VIDEO_BACKEND}，只有 H3 一个后端）")
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try:
         srv.serve_forever()

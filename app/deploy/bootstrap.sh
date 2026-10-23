@@ -204,9 +204,8 @@ YJ_IMAGE_MAX_SIDE=1536
 YJ_IMAGE_OFFLOAD=1
 
 # ---- 视频：MiniMax H3-Base（768p / 24fps / 原生立体声，音画一起出）
-# 快档 Wan2.2-5B 用来试构图（几分钟一条），H3 用来出终稿（音画一体）
+# 产品上只支持这一个视频后端，不再有第二档快模型
 YJ_VIDEO_MODEL=MiniMaxAI/MiniMax-H3
-YJ_VIDEO_FAST_MODEL=Wan-AI/Wan2.2-TI2V-5B
 # auto | diffusers | diffsynth | sglang | cmd
 YJ_VIDEO_BACKEND=auto
 # 48G 卡也建议开：H3 主干 + 32B 文本编码器全量放不下
@@ -314,7 +313,17 @@ EOF
 
 cmd_models() {
   load_env
-  local want="${1:-all}"
+  local want="${1:-auto}"
+  # auto = 按这台机器**实际显存**决定下哪些（deploy/vram-plan.sh）。
+  # 视频只有 H3 一个后端，默认那份是 NF4 量化版（只收 FL2VA 四件 = 34.4 GB，
+  # 官方口径最低 8 G 显存就能跑）。bf16 全量要 125 G 显存，`all` 里绝不该带上它。
+  if [ "$want" = "auto" ]; then
+    if [ -x "$ROOT/deploy/vram-plan.sh" ] || [ -f "$ROOT/deploy/vram-plan.sh" ]; then
+      want="$(bash "$ROOT/deploy/vram-plan.sh" --want 2>/dev/null | tr -d '\r')"
+    fi
+    [ -n "${want:-}" ] || want="all"
+    say "  按显存自动选择模型：$want"
+  fi
   local py="$ROOT/.venv/bin/python"
   [ -x "$py" ] || die "还没有 .venv，先跑：bash deploy/bootstrap.sh install --with-models"
 
@@ -326,13 +335,13 @@ cmd_models() {
 
   say ""
   say "════ 下载模型到 $dir（HF 镜像 $HF_ENDPOINT）════"
-  say "  图片  Qwen-Image-2.1            ~33 GB"
-  say "  视频  MiniMax-H3（最小权重集）  ~42 GB（全量 FL2VA 约 144 GB）"
-  say "  快档  Wan2.2-TI2V-5B            ~10 GB"
-  say "  文本  Qwen3-8B-Instruct         ~16 GB"
-  say "  语音  Qwen3-TTS-1.7B × 3        ~13 GB"
+  say "  图片  Qwen-Image-2.1                ~33 GB"
+  say "  视频  MiniMax-H3 NF4（默认）        ~34 GB（FL2VA 四件；8 G 显存起；唯一视频后端）"
+  say "        官方 bf16 全量要显式点名：models video-full   ~171 GB / 125 GB 显存"
+  say "  文本  Qwen3-8B-Instruct            ~16 GB"
+  say "  语音  Qwen3-TTS-1.7B × 3           ~13 GB"
   say "  ─────────────────────────────────────────────"
-  say "  合计约 114 GB（全量 H3 则 216 GB）"
+  say "  该装哪些由显存决定（deploy/vram-plan.sh）；视频只有 H3，NF4 是默认那份。"
 
   YJ_WANT="$want" YJ_MODEL_DIR="$dir" YJ_VOICE_DIR="$ROOT/vendor/voice/data/models" \
   "$py" - <<'PY'
@@ -340,15 +349,38 @@ import os
 import sys
 
 want = os.environ.get("YJ_WANT", "all")
+# want 允许三种形态：all / 单个 key / 空格或逗号分隔的多个 key。
+# 多个 key 是给「按显存自动选择」用的（见 deploy/vram-plan.sh）。
+_wants = None if want.strip() == "all" else set(want.replace(",", " ").split())
+
+def take(key):
+    # `video-full`（官方 bf16 全量 171 GB）**只能点名装**：
+    # 它要 125 GB 显存，`all` 里带上它等于让每台机器白下 171 GB。
+    if key == "video-full":
+        return _wants is not None and key in _wants
+    return _wants is None or key in _wants
 root = os.environ["YJ_MODEL_DIR"]
 vodir = os.environ["YJ_VOICE_DIR"]
 
-# (仓库, 目标子目录, 说明)。target=None 表示用 HF 的仓库名当目录名。
+# (仓库, 目标子目录, 说明, 只下这些路径)。最后一列为 None 表示整仓都下。
+#
+# 视频默认下 **DiffSynth 的 NF4 量化版**，不是官方 bf16 全量（171 GB / 125 GB 显存）。
+# NF4 仓库里其实躺着 5 个大分片（fl2va / ref2va / 各自的 pruned 版），
+# 我们只要 FL2VA 这一路的 4 个 —— 全收是 72.5 GB，收白名单是 34.4 GB。
+H3_NF4_FILES = [
+    "configuration.json",
+    "minimax-h3-fl2va-nf4.safetensors",
+    "minimax-h3-text-encoder-nf4.safetensors",
+    "video_vae_nf4.safetensors",
+    "audio_vae_nf4.safetensors",
+]
 PLAN = [
-    ("image",      "Qwen/Qwen-Image-2.1",                        None, "图片 · Qwen-Image-2.1"),
-    ("video",      "MiniMaxAI/MiniMax-H3",                       "h3", "视频 · MiniMax H3-Base"),
-    ("video-fast", "Wan-AI/Wan2.2-TI2V-5B",                      "wan22-5b", "快档 · Wan2.2-5B"),
-    ("text",       "Qwen/Qwen3-8B-Instruct",                      None, "文本 · Qwen3-8B"),
+    ("image",      "Qwen/Qwen-Image-2.1",              None,               "图片 · Qwen-Image-2.1", None),
+    ("video",      "DiffSynth-Studio/MiniMax-H3-NF4",  "MiniMax-H3-NF4",   "视频 · MiniMax H3 NF4（唯一视频后端）", H3_NF4_FILES),
+    # 分词器不在 NF4 仓里，只有 11 MB，但少了它 pipeline 拿不到 prompt 的 token
+    ("video",      "MiniMaxAI/MiniMax-H3",             "MiniMax-H3-NF4",   "视频 · H3 分词器（11 MB）", ["FL2VA/processor/*"]),
+    ("video-full", "MiniMaxAI/MiniMax-H3",             None,               "视频 · MiniMax H3 官方 bf16 全量（要 125 GB 显存）", None),
+    ("text",       "Qwen/Qwen3-8B-Instruct",           None,               "文本 · Qwen3-8B", None),
 ]
 
 VOICE = [
@@ -358,11 +390,15 @@ VOICE = [
     ("Qwen/Qwen3-TTS-Tokenizer-12Hz",        "qwen-tts-tokenizer", "语音 · 编解码器（必需）"),
 ]
 
-def download(repo, dest, label):
+def download(repo, dest, label, only=None):
     from huggingface_hub import snapshot_download
     print(f"\n── {label}\n   {repo} → {dest}", flush=True)
     try:
-        p = snapshot_download(repo_id=repo, local_dir=dest)
+        p = snapshot_download(
+            repo_id=repo,
+            local_dir=dest,
+            allow_patterns=only,      # None = 整仓
+        )
         print(f"   ✓ 就绪 {p}", flush=True)
         return True
     except Exception as e:
@@ -373,16 +409,29 @@ def download(repo, dest, label):
         return False
 
 ok = fail = 0
-for key, repo, sub, label in PLAN:
-    if want not in ("all", key):
+for key, repo, sub, label, only in PLAN:
+    if not take(key):
         continue
     dest = os.path.join(root, sub or repo.split("/")[-1])
-    if download(repo, dest, label):
+    if download(repo, dest, label, only):
         ok += 1
     else:
         fail += 1
 
-if want in ("all", "voice"):
+# 分词器是按仓库内的 FL2VA/processor/* 取下来的，落盘会带上那层目录；
+# DiffSynth 认的是包目录下的 processor/，所以搬平一层，顺手清掉空壳。
+for base in (os.path.join(root, "MiniMax-H3-NF4"),):
+    src = os.path.join(base, "FL2VA", "processor")
+    dst = os.path.join(base, "processor")
+    if os.path.isdir(src) and not os.path.isdir(dst):
+        os.rename(src, dst)
+        try:
+            os.rmdir(os.path.join(base, "FL2VA"))
+        except OSError:
+            pass
+        print(f"   ✓ 分词器已归位 {dst}", flush=True)
+
+if take("voice"):
     for repo, sub, label in VOICE:
         if download(repo, os.path.join(vodir, sub), label):
             ok += 1
@@ -394,7 +443,7 @@ sys.exit(1 if fail else 0)
 PY
   local rc=$?
   if [ "$rc" = "0" ]; then
-    ok "模型下载完成。Vram 账本：图片 22G（共享）/ 视频 34G（独占）"
+    ok "模型下载完成。Vram 账本：图片 22G（共享）/ 视频 H3-NF4 34G（独占）"
   else
     warn "有模型没下全。失败原因看上面；下完重跑：bash deploy/bootstrap.sh models $want"
   fi
@@ -467,7 +516,6 @@ cmd_start() {
   YJ_IMAGE_MAX_SIDE="${YJ_IMAGE_MAX_SIDE:-1536}" \
   YJ_IMAGE_OFFLOAD="${YJ_IMAGE_OFFLOAD:-1}" \
   YJ_VIDEO_MODEL="${YJ_VIDEO_MODEL:-MiniMaxAI/MiniMax-H3}" \
-  YJ_VIDEO_FAST_MODEL="${YJ_VIDEO_FAST_MODEL:-Wan-AI/Wan2.2-TI2V-5B}" \
   YJ_VIDEO_BACKEND="${YJ_VIDEO_BACKEND:-auto}" \
   YJ_VIDEO_OFFLOAD="${YJ_VIDEO_OFFLOAD:-1}" \
   YJ_MODE="${YJ_MODE:-full}" \
@@ -570,7 +618,8 @@ case "${1:-help}" in
     say "艺镜 Studio · 部署脚本"
     say ""
     say "  install [--with-models] [--with-voice]   装环境"
-    say "  models [all|image|video|video-fast|text|voice]   预下载模型（约 114 GB）"
+    say "  models [all|image|video|text|voice]   预下载模型（按显存自动取舍，别用 all）"
+    say "  models video-full                    只在 ≥125 GB 显存的卡上用（官方 bf16 全量，171 GB）"
     say "  start | stop | restart | status          启停 / 看状态"
     say "  autostart                                注册 systemd 开机自启（有 systemd 才有效）"
     ;;

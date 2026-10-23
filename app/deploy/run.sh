@@ -14,7 +14,20 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DATA="${YJ_DATA:-/root/cloud/yjai}"
 VENV="$ROOT/.venv"
 PY="$VENV/bin/python"
-NODE="${YJ_NODE:-/opt/node/bin/node}"
+# Node 路径不写死。宿主机上可能同时存在系统自带的老 node（有的镜像自带 v12，
+# 跑 host.mjs 会直接语法报错）和 init.sh 装到 /opt/node20 的新 node，
+# 而安装位置各家镜像并不统一。所以按「显式指定 → /opt/node20 → PATH」的顺序挑，
+# **挑的时候真的执行一次问版本**，低于 18 的跳过，不要凭路径猜。
+pick_node() {
+  local cand major
+  for cand in "${YJ_NODE:-}" /opt/node20/bin/node /opt/node/bin/node \
+              /usr/local/bin/node /usr/bin/node "$(command -v node 2>/dev/null)"; do
+    [ -n "$cand" ] && [ -x "$cand" ] || continue
+    major="$("$cand" -p 'process.versions.node.split(".")[0]' 2>/dev/null)"
+    if [ "${major:-0}" -ge 18 ] 2>/dev/null; then printf '%s' "$cand"; return 0; fi
+  done
+}
+NODE="$(pick_node)"
 LOG="$DATA/logs"
 
 mkdir -p "$DATA" "$LOG" "$DATA/projects" "$DATA/assets" "$DATA/thumbs"
@@ -34,16 +47,65 @@ YJ_MODEL_DIR="${YJ_MODEL_DIR:-/root/cloud/models}"
 export YJ_PORT="${YJ_MODEL_PORT:-3911}"
 export YJ_MODEL_DATA="${YJ_MODEL_DATA:-/root/cloud/model-data}"
 export YJ_IMAGE_MODEL="${YJ_IMAGE_MODEL:-$(pick_model Qwen-Image-2.1)}"
-# H3 的仓库根下只有 FL2VA / Ref2VA 两个分区，model_index.json 在分区里，
-# 所以必须指到 FL2VA 这一层，指到 MiniMax-H3 根目录 diffusers 认不出来
-export YJ_VIDEO_MODEL="${YJ_VIDEO_MODEL:-$YJ_MODEL_DIR/MiniMax-H3/FL2VA}"
-# 默认档走 Wan 5B：H3-Base 只有几十 G 显存的机器扛不住（权重 ~125 GB bf16），
-# 强行默认成 H3 会让「点生视频」变成等十分钟然后 OOM。H3 仍然留在别名表里，
-# 请求里写 model=h3 才会用。等换到 2×80G 或多卡，把 YJ_VIDEO_DEFAULT 改回去即可。
-# 注意仓库名带 -Diffusers 后缀：Wan 官方主仓库是原生权重（diffusion_pytorch_model + .pth），
-# DiffusionPipeline.from_pretrained 读不了，必须用转过格式的那一份（有 model_index.json）。
-export YJ_VIDEO_FAST_MODEL="${YJ_VIDEO_FAST_MODEL:-$(pick_model Wan2.2-TI2V-5B-Diffusers)}"
-export YJ_VIDEO_DEFAULT="${YJ_VIDEO_DEFAULT:-$YJ_VIDEO_FAST_MODEL}"
+# 视频**只有 MiniMax H3 一个后端**（Wan 那条降级档已移除，产品上明确不要）。
+#
+# H3 有两种落盘形态，两者目录结构完全不同，指错了 loader 会报「认不出这个目录」：
+#
+#   A. 官方 diffusers 仓库 `MiniMaxAI/MiniMax-H3`：根下只有 FL2VA / Ref2VA 两个分区，
+#      `model_index.json` 在分区里 → 必须指到 `<root>/FL2VA` 这一层。
+#   B. DiffSynth 的 NF4 量化版 `DiffSynth-Studio/MiniMax-H3-NF4`：扁平结构，
+#      根下就是 `configuration.json` + 几个 `*_nf4.safetensors` → 指到目录根。
+#
+# 按「哪个真存在」决定，不要按名字猜：这两种目录名都含 `MiniMax-H3`，
+# 拼死一个 `/FL2VA` 后缀在 B 上就是一条不存在的路径。
+# 走 pick_model 而不是拼 $YJ_MODEL_DIR：/root/models 上的权重会被优先选中
+# （系统盘 67 MB/s vs webdav 7–15 MB/s，加载一个几十 G 的模型差十几分钟）。
+pick_video() {
+  local base
+  for base in "${YJ_LOCAL_MODELS:-/root/models}" /root/cloud/models; do
+    # A：官方分区
+    if [ -f "$base/MiniMax-H3/FL2VA/model_index.json" ]; then
+      echo "$base/MiniMax-H3/FL2VA"; return
+    fi
+    # A'：目录名带后缀的官方分区（例如从平台 UI 下的 MiniMax-H3-Diffusers）
+    local d
+    for d in "$base"/MiniMax-H3*/; do
+      [ -d "$d" ] || continue
+      if [ -f "${d}FL2VA/model_index.json" ]; then echo "${d%/}/FL2VA"; return; fi
+      # B：NF4 扁平包
+      if [ -f "${d}configuration.json" ] && ls "${d}"*_nf4.safetensors >/dev/null 2>&1; then
+        echo "${d%/}"; return
+      fi
+    done
+  done
+  # 都没有：给官方路径，让上层照常报「权重缺」而不是报一个空字符串
+  echo "$(pick_model MiniMax-H3)/FL2VA"
+}
+export YJ_VIDEO_MODEL="${YJ_VIDEO_MODEL:-$(pick_video)}"
+export YJ_VIDEO_DEFAULT="${YJ_VIDEO_DEFAULT:-$YJ_VIDEO_MODEL}"
+# H3 的显存门槛取决于**盘上那份是哪一版**：
+#   · bf16 全量约 125 G（DiT 62 + Qwen3-VL 编码器 63）→ 全球也没几张消费卡能跑；
+#   · NF4 量化包官方口径「最低 8 G 显存即可运行」（DiffSynth 会自动做 disk offload），
+#     24 G 的 4090 是能出片的，只是慢。
+# 所以这里按目录形态判门槛，不能在 24 G 卡上无条件报「会失败」——
+# 那会让人以为买了张废卡，实际能跑。
+# 仍然**不在启动时降级到别的模型**（那是以前的做法），但要把话说在前面。
+_vram_gb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
+  | sort -rn | head -1 | awk '{ printf "%d", ($1 + 512) / 1024 }')
+_vram_gb="${_vram_gb:-0}"
+case "$YJ_VIDEO_MODEL" in
+  *nf4*|*NF4*) _vram_need=8 ;;
+  *)           _vram_need=125 ;;
+esac
+if [ ! -d "$YJ_VIDEO_MODEL" ]; then
+  # 30 G 镜像里放不下 34 G 的 NF4 权重，所以「盘上没有」是常见状态，不是故障。
+  # 说清「没装」比甩一串显存门槛有用。
+  echo "  · 视频：未安装权重（$YJ_VIDEO_MODEL 不存在）"
+  echo "    装：bash deploy/bootstrap.sh models video   （NF4 约 34 GB）"
+elif [ "$_vram_gb" -gt 0 ] && [ "$_vram_gb" -lt "$_vram_need" ]; then
+  echo "  ! 视频：当前权重（${YJ_VIDEO_MODEL}）需要 ${_vram_need} G 以上显存，"
+  echo "    这台只有 ${_vram_gb} G —— 生视频会显存不足。换 NF4 量化版可降到 8 G 起。"
+fi
 # 文本：chat-server 监听 8001，正好是 model-server 默认的 TEXT_UPSTREAM
 export YJ_TEXT_PORT="${YJ_TEXT_PORT:-8001}"
 export YJ_TEXT_MODEL="${YJ_TEXT_MODEL:-$(pick_model Qwen3-8B)}"
@@ -135,6 +197,10 @@ start_chat() {
 start_host() {
   if curl -sf -m 3 "http://127.0.0.1:6006/healthz" >/dev/null 2>&1; then
     echo "  host 已在 6006"; return
+  fi
+  if [ -z "$NODE" ]; then
+    echo "  ✗ host 启动失败：找不到 Node 18+（装到 /opt/node20 或设 YJ_NODE=<路径>）"
+    return 1
   fi
   if alive 6006; then
     stop_one 6006 "host(残留)"
