@@ -1,6 +1,6 @@
 {
   "name": "yijing-studio",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "艺镜 Studio —— 混淆构建产物（不含源码），仅允许非商业使用",
   "main": "dist-electron/electron/main.js",
