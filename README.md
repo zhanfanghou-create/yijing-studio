@@ -7,7 +7,7 @@
 把剧本、角色、分镜、出图、出片串成一张可以随便拖的无限画布。
 Windows 桌面端 · Electron + React + React Flow · 全部模型跑在本机，不连任何云端 API
 
-![版本](https://img.shields.io/badge/版本-0.1.2-8b5cf6?style=flat-square)
+![版本](https://img.shields.io/badge/版本-0.1.3-8b5cf6?style=flat-square)
 ![平台](https://img.shields.io/badge/平台-Windows%2010%2F11%20x64-0078d4?style=flat-square)
 ![运行时](https://img.shields.io/badge/运行时-Electron%2044-47848f?style=flat-square)
 ![推理](https://img.shields.io/badge/推理-100%25%20本地-22c55e?style=flat-square)
@@ -81,7 +81,7 @@ Windows 桌面端 · Electron + React + React Flow · 全部模型跑在本机�
 - 每个节点卡片上能点的控件，都必须改动**真正提交给模型的那个字段**，否则不显示 —— 没有装饰性按钮。
 - 右侧「创作助手」是一个能读画布、也能改画布的 Agent。它看到的是当前画布的真实状态，不是猜的。
 
-> **0.1.2 的定位**：单机、单用户、离线优先。协作只做到同机多窗口，没有跨设备同步。
+> **0.1.3 的定位**：单机、单用户、离线优先。协作只做到同机多窗口，没有跨设备同步。
 > 详见 [已知限制](#已知限制)。
 
 ---
@@ -253,13 +253,13 @@ Windows 桌面端 · Electron + React + React Flow · 全部模型跑在本机�
 
 ### 方式一：装安装包（推荐）
 
-从 [Releases](https://github.com/zhanfanghou-create/yijing-studio/releases) 下载 `YijingStudio-0.1.2-win-x64.exe`，双击安装。
+从 [Releases](https://github.com/zhanfanghou-create/yijing-studio/releases) 下载 `YijingStudio-0.1.3-win-x64.exe`，双击安装。
 
 - 安装向导可改安装目录，会建桌面快捷方式和开始菜单项
 - 首次启动会引导你做一次**配置检测**，缺什么补什么
 - 模型不随安装包分发，需要在应用内下载（见下一节）
 
-> **关于 Windows SmartScreen**：0.1.2 没有购买商业代码签名证书，首次运行可能提示
+> **关于 Windows SmartScreen**：0.1.3 没有购买商业代码签名证书，首次运行可能提示
 > 「Windows 已保护你的电脑」。点「更多信息 → 仍要运行」即可。
 > 安装包的 SHA-256 会在 Release 页面给出，可自行校验。
 
@@ -306,7 +306,7 @@ npm run dist:win     # electron-builder → NSIS 安装包
 
 ## 本地模型
 
-**0.1.2 只调用本机模型，不连任何云端 API。** 这不是一个开关，是三道路障：
+**0.1.3 只调用本机模型，不连任何云端 API。** 这不是一个开关，是三道路障：
 
 1. 预设层：启动时丢弃所有非回环通道
 2. 存储层：写入前归一化，云端配置直接拒绝
@@ -457,7 +457,7 @@ npm run dist:win     # electron-builder → NSIS 安装包
 
 **双宿主同构。** 同一套渲染层既能在桌面跑（`preload.ts` 的 contextBridge），
 也能在浏览器里跑（`web/shim.ts` 把 `window.yj.*` 代理到 `/api/rpc`）。
-这是开发期的便利，不是产品形态 —— 0.1.2 只发布桌面端。
+这是开发期的便利，不是产品形态 —— 0.1.3 只发布桌面端。
 
 ---
 
@@ -507,7 +507,7 @@ npm run dist:win     # electron-builder → NSIS 安装包
 <details>
 <summary><b>能不能连自己的云端 API</b></summary>
 
-0.1.2 刻意不允许。所有通道在预设层、存储层、请求出口三层都会被归一化或拦截。
+0.1.3 刻意不允许。所有通道在预设层、存储层、请求出口三层都会被归一化或拦截。
 这个限制是为了保证「不上传素材」这件事是可验证的，而不只是口头承诺。
 </details>
 
@@ -515,13 +515,13 @@ npm run dist:win     # electron-builder → NSIS 安装包
 <summary><b>协作功能在哪</b></summary>
 
 只做了同机多窗口（BroadcastChannel），没有跨设备 CRDT，也没有入口暴露在界面上。
-0.1.2 不把它当作可用功能。
+0.1.3 不把它当作可用功能。
 </details>
 
 <details>
 <summary><b>安装包为什么没签名 / 会不会报毒</b></summary>
 
-0.1.2 没有购买商业代码签名证书。SmartScreen 会提示未知发布者，属预期。
+0.1.3 没有购买商业代码签名证书。SmartScreen 会提示未知发布者，属预期。
 Release 页面给出 SHA-256，可自行校验完整性。混淆会让部分启发式引擎产生误报，
 如果你在意，建议用仓库里的 `app/` 自行跑一份对比。
 </details>
@@ -529,6 +529,20 @@ Release 页面给出 SHA-256，可自行校验完整性。混淆会让部分启�
 ---
 
 ## 版本记录
+
+### 0.1.3
+
+修掉 0.1.2 图标被纵向拉长的问题。功能与 0.1.2 完全一致。
+
+做 0.1.2 的小尺寸图标时，先把底部文字条裁掉得到 1024×829 的图案，
+再把它 `resize` 到 1024×1024 去「撑满」正方形 —— 宽缩到 1/4、高缩到 1/3.2，
+纵向被放大 **1.24 倍**。大图标上看不出来，但 16 / 24 / 32 px 的任务栏图标里，
+猫头鹰的脸明显发长。
+
+现在七档（256 / 128 / 64 / 48 / 32 / 24 / 16）全部是原图直接等比缩放，
+不拉伸、不裁切，每档与「原图缩到这个尺寸」逐像素一致（最大通道差 0）。
+所有尺寸都保留原图的完整构图，包括底部那条「Minimax H3」——
+32 px 以下这条字会糊成一条紫带，但图案不变形。
 
 ### 0.1.2
 
