@@ -134,43 +134,143 @@ def h3_diffusers(args, w, h, frames, status, tick):
     return (frames_out[0] if isinstance(frames_out, (list, tuple)) else frames_out), audio
 
 
+# NF4 包里真正要用到的四件。顺序照官方 `MiniMax-H3-NF4-FL2VA.py` 示例，
+# 少一件都加载不起来，所以缺哪个就在报错里点名。
+DS_NF4_FILES = (
+    "minimax-h3-fl2va-nf4.safetensors",
+    "minimax-h3-text-encoder-nf4.safetensors",
+    "video_vae_nf4.safetensors",
+    "audio_vae_nf4.safetensors",
+)
+
+
 def h3_diffsynth(args, w, h, status, tick):
     """
-    DiffSynth-Studio 路线（ModelScope 官方推荐的 NF4 搭配）。
+    DiffSynth 路线（ModelScope 官方的 NF4 配方）。
 
-    优点：纯 Python、不需要 ComfyUI、NF4 版显存最省；
-    缺点：API 随版本变动，所以这里做成「有就调，没有就说清楚缺什么」。
+    **为什么不能走 diffusers**：NF4 包是 DiffSynth 的单文件格式 —— 四个
+    `*_nf4.safetensors` 加一个 `configuration.json`，**没有 `model_index.json`**，
+    也没有按组件分目录。`DiffusionPipeline.from_pretrained` 认的是那套目录结构，
+    所以「34 GB 下完了、进度 100%、加载还是失败」的根因不在权重，在运行时。
+
+    API 取 2026-11 上游 main 分支（`diffsynth.pipelines.minimax_h3_audio_video`）：
+    PyPI 上的 2.2.0 里没有这个模块，必须 `pip install --no-deps -e <源码目录>`。
+
+    首尾帧在这里是真支持的：官方 fl2va 示例就是
+    `keyframes=[first, last], keyframe_indices=[0, -1]`。
     """
     try:
-        from diffsynth.pipelines.minimax_h3 import MiniMaxH3Pipeline  # noqa: PLC0415
+        from diffsynth.pipelines.minimax_h3_audio_video import (  # noqa: PLC0415
+            MiniMaxH3Pipeline,
+            ModelConfig,
+        )
+        from diffsynth.utils.data.audio_video import write_video_audio  # noqa: PLC0415
     except Exception as e:
         raise RuntimeError(
-            f"没有 DiffSynth 的 H3 pipeline（{e}）。装法："
-            " git clone https://github.com/modelscope/DiffSynth-Studio && pip install -e '.[quant]'"
+            f"没有 DiffSynth 的 H3 管线（{e}）。PyPI 的 2.2.0 缺这个模块，装法："
+            " curl -sL https://codeload.github.com/modelscope/DiffSynth-Studio/tar.gz/refs/heads/main"
+            " | tar xz -C /root/ds-src --strip-components=1 && "
+            ".venv/bin/pip install --no-deps -e /root/ds-src"
         )
 
     import torch
+    from PIL import Image
+
+    root = Path(args.model)
+    missing = [n for n in DS_NF4_FILES if not (root / n).is_file()]
+    if missing:
+        raise RuntimeError(
+            "NF4 权重不齐，缺：" + "、".join(missing)
+            + "（在「模型配置」里把视频模型下完，或 bash deploy/bootstrap.sh models video）"
+        )
+
+    # 低显存档位：权重放磁盘、用时再搬。48 G 的卡也建议这么配 ——
+    # 主干 + 文本编码器全量常驻会顶到边，和语音抢显存时直接 OOM。
+    vram = {
+        "offload_dtype": "disk", "offload_device": "disk",
+        "onload_dtype": "disk", "onload_device": "disk",
+        "preparing_dtype": torch.bfloat16, "preparing_device": "cuda",
+        "computation_dtype": torch.bfloat16, "computation_device": "cuda",
+    }
+    configs = [ModelConfig(path=str(root / n), skip_download=True, **vram) for n in DS_NF4_FILES]
+
+    # processor（tokenizer + 视频预处理）在包的 `processor/` 子目录里；
+    # 没有的话回落到仓库 id —— 但它只有几 MB，下载器早就一起拉下来了。
+    proc_dir = root / "processor"
+    processor = (
+        ModelConfig(path=str(proc_dir), skip_download=True)
+        if (proc_dir / "preprocessor_config.json").is_file()
+        else ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="FL2VA/processor/")
+    )
 
     write_status(status, status="processing", progress=0.08,
-                 message="加载 H3-NF4 权重（首次 3-8 分钟）")
+                 message="加载 H3-NF4（首次 4-10 分钟，之后常驻）")
     pipe = MiniMaxH3Pipeline.from_pretrained(
-        model_id=args.model if "nf4" in args.model.lower() else "DiffSynth-Studio/MiniMax-H3-NF4",
         torch_dtype=torch.bfloat16,
         device="cuda",
+        model_configs=configs,
+        processor_config=processor,
+        vram_limit=max(6.0, torch.cuda.mem_get_info("cuda")[1] / 1024 ** 3 - 4),
     )
+
+    # H3 的帧数不是任意值：画布几何按 `17n + 5` 排，取最近的一档，
+    # 否则会得到「时长对了但最后一帧被截」这种看不出来的偏差。
+    want = max(24, int(round(args.duration * 24)))
+    n = max(1, int(round((want - 5) / 17)))
+    frames = 17 * n + 5
+
+    def _bar(it):
+        """替掉 tqdm：把步数写进任务状态里，前端才有真实进度条。
+
+        `MiniMaxH3Pipeline.__call__` 没有 `progress_callback` 这个形参，
+        只认 `progress_bar_cmd` —— 传错名字会直接 TypeError，
+        所以这里做成「迭代器包装」而不是回调。
+        """
+        items = list(it)
+        total = max(1, len(items))
+        for i, x in enumerate(items):
+            write_status(status, status="processing",
+                         progress=0.15 + 0.7 * (i + 1) / total,
+                         message=f"采样 {i + 1}/{total}")
+            yield x
+
     kw = dict(
-        prompt=args.prompt, height=h, width=w,
+        prompt=args.prompt,
+        height=h,
+        width=w,
+        num_frames=frames,
         num_inference_steps=args.steps or 50,
-        num_frames=max(24, int(args.duration * 24)),
-        cfg_scale=float(os.environ.get("YJ_H3_CFG", "7.0")),
-        progress_callback=tick,
+        cfg_scale=float(os.environ.get("YJ_H3_CFG", "1.0")),
+        progress_bar_cmd=_bar,
+        seed=int(args.seed) if args.seed not in (None, "") else 0,
     )
-    if args.image:
-        kw["input_image"] = args.image[0]
-    out = pipe(**kw)
-    video = getattr(out, "video", None) or out
-    audio = getattr(out, "audio", None)
-    return video, audio
+
+    # 关键帧：有尾帧 → fl2va（首尾过渡）；只有首帧 → 首帧条件；都没有 → t2va
+    keyframes = [Image.open(args.image[0]).convert("RGB")] if args.image else []
+    if args.last_frame:
+        keyframes.append(Image.open(args.last_frame).convert("RGB"))
+        kw["keyframes"] = keyframes
+        kw["keyframe_indices"] = [0, -1]
+        write_status(status, status="processing", progress=0.12,
+                     message=f"首尾帧模式（{frames} 帧 {w}x{h}）")
+    elif keyframes:
+        kw["keyframes"] = keyframes
+        kw["keyframe_indices"] = [0]
+        write_status(status, status="processing", progress=0.12,
+                     message=f"首帧模式（{frames} 帧 {w}x{h}）")
+    else:
+        write_status(status, status="processing", progress=0.12,
+                     message=f"文生视频（{frames} 帧 {w}x{h}）")
+
+    video, audio = pipe(**kw)
+
+    # 写成 raw_ 前缀：main 那边会再拷成 tmp_ 并落到 `vid_<job>.mp4`，
+    # 直接写最终名会让它自己拷自己（SameFileError）。
+    dest = Path(args.out) / f"raw_{args.job}.mp4"
+    write_video_audio(video=video, audio=audio, output_path=str(dest), fps=24,
+                      audio_sample_rate=32000)
+    # 已经合流好了：返回路径，让 main 走「拷贝到 dest」那条分支，不再二次处理
+    return dest, None
 
 
 def h3_sglang(args, w, h, status):
@@ -286,6 +386,9 @@ def main():
     ap.add_argument("--duration", type=float, default=5.0)
     ap.add_argument("--size", default="")
     ap.add_argument("--image", action="append", default=None)
+    # 尾帧只收不用：H3 的两条本机路线（diffusers / DiffSynth）都只接一张条件图。
+    # 收下参数是为了「收到但用不上」能被记录下来，而不是当场 Exit 2 让人以为是参数写错了。
+    ap.add_argument("--last-frame", default=None)
     ap.add_argument("--backend", default="auto")
     ap.add_argument("--variant", default="auto")
     ap.add_argument("--steps", type=int, default=0)
@@ -304,7 +407,8 @@ def main():
         frames = max(24 if h3 else 17, int(round(args.duration * fps / 4)) * 4 + 1)
 
         write_status(status, status="processing", progress=0.02,
-                     message=f"{Path(args.model).name} · {w}x{h} · {args.duration:g}s")
+                     message=f"{Path(args.model).name} · {w}x{h} · {args.duration:g}s"
+                             f"{' · 尾帧未生效' if args.last_frame else ''}")
 
         def tick(pipeline=None, step=0, timestep=None, kwargs=None):
             total = args.steps or (50 if h3 else 30)

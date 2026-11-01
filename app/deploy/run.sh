@@ -11,6 +11,16 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# 本机覆盖：一行一个 KEY=VALUE，用来放「这台机器和别人不一样」的设置，不进仓库。
+# 典型用途：YJ_INSTALL_ROOT=/root/models
+#   —— 云盘挂载不稳、或者冷读太慢时，把权重装到系统盘（67 MB/s vs 7–15 MB/s）。
+# `set -a` 让 source 进来的变量自动 export，下游 python / node 才看得到。
+if [ -f "$ROOT/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$ROOT/.env"
+  set +a
+fi
 DATA="${YJ_DATA:-/root/cloud/yjai}"
 VENV="$ROOT/.venv"
 PY="$VENV/bin/python"
@@ -43,7 +53,14 @@ pick_model() {
   if [ -d "$local_root/$name" ]; then echo "$local_root/$name"; else echo "/root/cloud/models/$name"; fi
 }
 
-YJ_MODEL_DIR="${YJ_MODEL_DIR:-/root/cloud/models}"
+YJ_MODEL_DIR="${YJ_MODEL_DIR:-/root/models}"
+# 配置检测里点「下载」时的**落盘根**。默认系统盘（2026-11-01 改口径）：
+#   · 云储存 ¥0.00036/GB/小时（免费 25 GB），镜像 ¥0.00003/GB/小时（免费 30 GB），差 12 倍；
+#   · 官方明确「存镜像时云储存里的数据不进镜像」—— 权重留在云盘，镜像永远是空壳，
+#     云储存费也永远省不掉，删了实例还在扣。
+# 所以权重一律落系统盘、由镜像带走；要改回云盘就在 .env 里写 YJ_INSTALL_ROOT=/root/cloud/models。
+# 宿主与检测**必须用同一个值**，否则又是「下到 A、查 B」。
+export YJ_INSTALL_ROOT="${YJ_INSTALL_ROOT:-$YJ_MODEL_DIR}"
 export YJ_PORT="${YJ_MODEL_PORT:-3911}"
 export YJ_MODEL_DATA="${YJ_MODEL_DATA:-/root/cloud/model-data}"
 export YJ_IMAGE_MODEL="${YJ_IMAGE_MODEL:-$(pick_model Qwen-Image-2.1)}"
@@ -78,11 +95,21 @@ pick_video() {
       fi
     done
   done
-  # 都没有：给官方路径，让上层照常报「权重缺」而不是报一个空字符串
-  echo "$(pick_model MiniMax-H3)/FL2VA"
+  # 都没有：**什么都不输出**。
+  #
+  # 以前这里 echo "$(pick_model MiniMax-H3)/FL2VA"，好让上层「照常报权重缺」。
+  # 代价是 YJ_VIDEO_MODEL 被 export 成一条**不存在**的路径，而宿主进程的
+  # `resolveModelDir()` 见到 env 就直接用 —— 于是配置检测永远盯着那条空路径：
+  # 面板里下完 34 GB、进度 100%、清单也写了，状态栏还是「未下载」。
+  # 空字符串的含义是「没配」，让 model-server 用它自己的默认（仓库 id）、
+  # 让宿主按目录名去扫 —— 两边都能在权重出现后**自动看见**，不必重启。
 }
-export YJ_VIDEO_MODEL="${YJ_VIDEO_MODEL:-$(pick_video)}"
-export YJ_VIDEO_DEFAULT="${YJ_VIDEO_DEFAULT:-$YJ_VIDEO_MODEL}"
+
+_video_dir="$(pick_video)"
+if [ -n "$_video_dir" ]; then
+  export YJ_VIDEO_MODEL="${YJ_VIDEO_MODEL:-$_video_dir}"
+  export YJ_VIDEO_DEFAULT="${YJ_VIDEO_DEFAULT:-$YJ_VIDEO_MODEL}"
+fi
 # H3 的显存门槛取决于**盘上那份是哪一版**：
 #   · bf16 全量约 125 G（DiT 62 + Qwen3-VL 编码器 63）→ 全球也没几张消费卡能跑；
 #   · NF4 量化包官方口径「最低 8 G 显存即可运行」（DiffSynth 会自动做 disk offload），
@@ -93,15 +120,17 @@ export YJ_VIDEO_DEFAULT="${YJ_VIDEO_DEFAULT:-$YJ_VIDEO_MODEL}"
 _vram_gb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
   | sort -rn | head -1 | awk '{ printf "%d", ($1 + 512) / 1024 }')
 _vram_gb="${_vram_gb:-0}"
-case "$YJ_VIDEO_MODEL" in
+case "${YJ_VIDEO_MODEL:-}" in
   *nf4*|*NF4*) _vram_need=8 ;;
   *)           _vram_need=125 ;;
 esac
-if [ ! -d "$YJ_VIDEO_MODEL" ]; then
+if [ -z "${YJ_VIDEO_MODEL:-}" ] || [ ! -d "$YJ_VIDEO_MODEL" ]; then
   # 30 G 镜像里放不下 34 G 的 NF4 权重，所以「盘上没有」是常见状态，不是故障。
-  # 说清「没装」比甩一串显存门槛有用。
-  echo "  · 视频：未安装权重（$YJ_VIDEO_MODEL 不存在）"
-  echo "    装：bash deploy/bootstrap.sh models video   （NF4 约 34 GB）"
+  # 说清「没装」比甩一串显存门槛有用。两条补装路径都写上：
+  # 网页面板那条是现在的主路径（宿主自己下、能续传），bootstrap 那条留给纯命令行。
+  echo "  · 视频：未安装权重（${YJ_VIDEO_MODEL:-未配置}）"
+  echo "    装：网页「模型配置」里点视频模型下载（落盘 ${YJ_INSTALL_ROOT}/MiniMax-H3-NF4，约 34 GB）"
+  echo "        或 bash deploy/bootstrap.sh models video"
 elif [ "$_vram_gb" -gt 0 ] && [ "$_vram_gb" -lt "$_vram_need" ]; then
   echo "  ! 视频：当前权重（${YJ_VIDEO_MODEL}）需要 ${_vram_need} G 以上显存，"
   echo "    这台只有 ${_vram_gb} G —— 生视频会显存不足。换 NF4 量化版可降到 8 G 起。"
@@ -218,6 +247,32 @@ start_host() {
   fi
 }
 
+# 自定义服务入口（仙宫云「艺镜AI 官网」那一条，8899）。
+# 它只做一件事：把浏览器跳到官网。不碰模型、不占显存、不读权重，
+# 所以优先用系统 python3 —— venv 还没建好时也能起，这是用户最先想点的入口。
+start_link() {
+  local port="${YJ_LINK_PORT:-8899}" py
+  if curl -sf -m 2 "http://127.0.0.1:${port}/healthz" >/dev/null 2>&1; then
+    echo "  link  已在 ${port}"; return
+  fi
+  if alive "$port"; then
+    stop_one "$port" "link(残留)"
+    wait_free "$port" || echo "  ! 端口 ${port} 仍被占，仍尝试启动"
+  fi
+  for py in "$PY" "$(command -v python3 2>/dev/null)" /usr/bin/python3 /usr/local/bin/python3; do
+    [ -n "$py" ] && [ -x "$py" ] && break
+    py=""
+  done
+  if [ -z "$py" ]; then echo "  link 跳过（找不到 python3）"; return; fi
+  cd "$ROOT" || return 1
+  YJ_LINK_PORT="$port" setsid nohup "$py" "$ROOT/deploy/home-link.py" >"$LOG/link.log" 2>&1 &
+  if wait_http "http://127.0.0.1:${port}/healthz"; then
+    echo "  ✓ link   http://0.0.0.0:${port}/ → ${YJ_LINK_TARGET:-https://www.yjai.top/}"
+  else
+    echo "  ✗ link 启动失败："; tail -12 "$LOG/link.log"
+  fi
+}
+
 start_voice() {
   if curl -sf -m 3 "http://127.0.0.1:${YJ_VOICE_PORT}/healthz" >/dev/null 2>&1; then
     echo "  voice 已在 ${YJ_VOICE_PORT}"; return
@@ -262,6 +317,10 @@ cmd_status() {
   if alive 6006; then
     echo "  host   6006  up   $(curl -s -m 4 http://127.0.0.1:6006/healthz | head -c 160)"
   else echo "  host   6006  down"; fi
+  # 官网入口只做跳转，健康检查回了就能点，不必看别的东西
+  if curl -sf -m 2 "http://127.0.0.1:${YJ_LINK_PORT:-8899}/healthz" >/dev/null 2>&1; then
+    echo "  link   ${YJ_LINK_PORT:-8899}  up   → ${YJ_LINK_TARGET:-https://www.yjai.top/}"
+  else echo "  link   ${YJ_LINK_PORT:-8899}  down"; fi
   if alive "$YJ_TEXT_PORT"; then
     echo "  chat   $YJ_TEXT_PORT  up   $(curl -s -m 4 http://127.0.0.1:$YJ_TEXT_PORT/healthz | head -c 160)"
   else echo "  chat   $YJ_TEXT_PORT  down"; fi
@@ -275,20 +334,59 @@ cmd_status() {
   df -h /root/cloud / 2>/dev/null | tail -2
 }
 
+# 单个服务的名字 → 起点 / 端口。`start model` 这种用法是必需的：
+# 只改了一个 python 服务时去 `restart` 全家桶，会把正在跑的 34 GB 下载
+# （宿主进程里的后台任务，只在内存里）一起干掉。少一次全量重启就少一次事故。
+svc_port() {
+  case "$1" in
+    link)  echo "${YJ_LINK_PORT:-8899}" ;;
+    chat)  echo "$YJ_TEXT_PORT" ;;
+    voice) echo "$YJ_VOICE_PORT" ;;
+    model) echo 3911 ;;
+    host)  echo 6006 ;;
+    *)     echo "" ;;
+  esac
+}
+svc_start() {
+  case "$1" in
+    link)  start_link ;;
+    chat)  start_chat ;;
+    voice) start_voice ;;
+    model) start_model ;;
+    host)  start_host ;;
+  esac
+}
+# 名字 → 给人看的标签，只用于停服务时的日志
+svc_stop() {
+  local port; port="$(svc_port "$1")"
+  [ -n "$port" ] && stop_one "$port" "$1"
+}
+
+ALL_SVCS="link chat voice model host"
+
 case "${1:-status}" in
-  start)   start_chat; start_voice; start_model; start_host ;;
-  stop)    stop_one "$YJ_TEXT_PORT" chat; stop_one "$YJ_VOICE_PORT" voice; stop_one 3911 model; stop_one 6006 host ;;
+  # link 放最前：它零成本秒起，别让「等 host 探活 30 秒」拖住那个入口
+  start)
+    if [ -n "${2:-}" ]; then svc_start "$2"; else for s in $ALL_SVCS; do svc_start "$s"; done; fi ;;
+  stop)
+    if [ -n "${2:-}" ]; then svc_stop "$2"; else for s in $ALL_SVCS; do svc_stop "$s"; done; fi ;;
   restart)
-    stop_one "$YJ_VOICE_PORT" voice; stop_one "$YJ_TEXT_PORT" chat; stop_one 3911 model; stop_one 6006 host
-    wait_free "$YJ_VOICE_PORT"; wait_free "$YJ_TEXT_PORT"; wait_free 3911; wait_free 6006
-    start_chat; start_voice; start_model; start_host ;;
+    if [ -n "${2:-}" ]; then
+      svc_stop "$2"; wait_free "$(svc_port "$2")"; svc_start "$2"
+    else
+      # 顺序沿用原样：先停 link/voice/chat，再 model/host
+      for s in link voice chat model host; do svc_stop "$s"; done
+      for s in $ALL_SVCS; do wait_free "$(svc_port "$s")"; done
+      for s in $ALL_SVCS; do svc_start "$s"; done
+    fi ;;
   status)  cmd_status ;;
   log)
     case "${2:-model}" in
       host)  tail -40 "$LOG/host.log" ;;
       chat)  tail -40 "$LOG/chat.log" ;;
       voice) tail -40 "$LOG/voice.log" ;;
+      link)  tail -40 "$LOG/link.log" ;;
       *)     tail -40 "$LOG/model.log" ;;
     esac ;;
-  *) echo "用法: bash deploy/run.sh start|stop|restart|status|log [model|host|chat|voice]"; exit 2 ;;
+  *) echo "用法: bash deploy/run.sh start|stop|restart|status|log [model|host|chat|voice|link]"; exit 2 ;;
 esac

@@ -64,7 +64,10 @@ STATUS = DATA / "jobs"
 TEXT_UPSTREAM = os.environ.get("YJ_TEXT_UPSTREAM", "http://127.0.0.1:8001/v1").rstrip("/")
 VOICE_BASE = os.environ.get("YJ_VOICE_BASE", "http://127.0.0.1:3910").rstrip("/")
 IMAGE_MODEL = os.environ.get("YJ_IMAGE_MODEL", "Qwen/Qwen-Image-2.1")
-VIDEO_MODEL = os.environ.get("YJ_VIDEO_MODEL", "MiniMaxAI/MiniMax-H3")
+# 空字符串 = 没配。`os.environ.get(k, default)` 在「变量存在但为空」时会返回 ''，
+# 那样 VIDEO_MODEL 变成空路径，`_has_weights('')` 会去 stat 当前目录 —— 一个假的绿。
+_VIDEO_ENV = os.environ.get("YJ_VIDEO_MODEL", "").strip()
+VIDEO_MODEL = _VIDEO_ENV or "MiniMaxAI/MiniMax-H3"
 # 视频**只有 H3 一个后端**。以前这里有第二个档（Wan2.2-TI2V-5B，作为小显存机器的
 # 降级），产品上明确不要了：与其维护两套采样参数、两套帧率（H3 24fps / Wan 16fps）、
 # 两套尺寸归一化，不如只留一条链路，硬件不够就直说硬件不够。
@@ -73,7 +76,7 @@ VIDEO_MODEL = os.environ.get("YJ_VIDEO_MODEL", "MiniMaxAI/MiniMax-H3")
 # 官方 NF4 版约 42 GB 但仍需 30–36 GB 显存。也就是说**单卡 24 GB 跑不了**，
 # 48 GB 是起步线。显存不够时这里不会静默降级到别的模型，而是让请求失败 ——
 # 「悄悄换了个模型出片」比「直接告诉我不够」有害得多。
-VIDEO_DEFAULT = os.environ.get("YJ_VIDEO_DEFAULT", VIDEO_MODEL)
+VIDEO_DEFAULT = os.environ.get("YJ_VIDEO_DEFAULT", "").strip() or VIDEO_MODEL
 VIDEO_BACKEND = os.environ.get("YJ_VIDEO_BACKEND", "auto")
 IMAGE_STEPS = int(os.environ.get("YJ_IMAGE_STEPS", "28"))
 IMAGE_MAX_SIDE = int(os.environ.get("YJ_IMAGE_MAX_SIDE", "1536"))
@@ -111,6 +114,9 @@ class Lease:
     def __init__(self):
         self.holder = None          # None | "image" | "video"
         self.lock = threading.Lock()
+        # 图片请求的串行闸：不是「租约」，是「排队」——单卡只有一份管线，
+        # 并发调用会把 CPU offload 的 hook 搅乱（见 generate_image 注释）。
+        self.image_lock = threading.Lock()
         self.image_pipe = {"key": None, "pipe": None, "kind": None}
         self.voice_evicted = False
 
@@ -283,6 +289,16 @@ def _load_image_pipe(kind, model_id):
 
     name, cls = _pick_image_class()
     LEASE.acquire("image")
+
+    # 换形态（text↔edit）时先把旧管线丢掉再加载：
+    # 两个管线各自的 `enable_model_cpu_offload()` 会往同一批模块上挂 hook，
+    # 旧的留在内存里就会被下一轮 offload 覆盖，报出来的是一句看不懂的
+    # `'Qwen3VLForConditionalGeneration' object has no attribute '_hf_hook'`。
+    if LEASE.image_pipe["pipe"] is not None:
+        LEASE.image_pipe = {"key": None, "pipe": None, "kind": None}
+        gc.collect()
+        torch.cuda.empty_cache()
+
     log(f"加载 {model_id}（{name}, {kind}）—— 首次 1-3 分钟，之后常驻")
 
     t0 = time.time()
@@ -355,6 +371,21 @@ def _resolve_repo(name, default, alias=None):
 
 
 def generate_image(body):
+    """
+    图片请求**串行**执行。
+
+    单卡上只有一份图片管线，而 `enable_model_cpu_offload()` 是把 hook 挂在模块上、
+    按需在 CPU/GPU 之间搬权重的 —— 两个请求同时进来就会互相把对方搬一半的模块
+    再搬走，报出来的是 `object has no attribute '_hf_hook'` 这种不像人话的 500。
+    客户端上一秒点了「生成」、下一秒又点了别的卡，正好撞进这个窗口。
+
+    排队比并发快：一个请求 20–90 秒，并发的代价是两边都失败还要重新加载 31 GB 权重。
+    """
+    with LEASE.image_lock:
+        return _generate_image_locked(body)
+
+
+def _generate_image_locked(body):
     prompt = (body.get("prompt") or "").strip()
     if not prompt:
         raise ValueError("没有提示词")
@@ -426,18 +457,85 @@ def _worker_path():
     return str(ROOT / "video_worker.py")
 
 
+VIDEO_LONG_SIDE = {"480p": 832, "720p": 1344, "1080p": 1920, "1440p": 2560}
+
+# 尾帧能不能吃，取决于 worker 走哪条路线：
+# DiffSynth（NF4，主路线）走 `keyframes=[first, last]`，真支持；
+# diffusers 的模块化管线也有 `last_image`，但我们这份 NF4 权重它加载不了。
+# 所以「能」——worker 拿到 `--last-frame` 就会用。
+VIDEO_LAST_FRAME = True
+
+
+def _align16(v):
+    return max(256, int(round(v / 16.0)) * 16)
+
+
+def _video_size(body):
+    """提交尺寸：优先客户端给的 `WxH`，其次按 `aspect_ratio` + `resolution` 现算。
+
+    以前这里把 `resolution`（"720p"）当 size 直接交给 worker，
+    `norm_size` 解析不了就退回 1344×768 —— 于是「9:16 竖版」出来的是一张横片，
+    而且全程不报错。网页端此前只发 aspect_ratio，正好踩在这条路上。
+    """
+    raw = str(body.get("size") or "").strip().lower().replace("*", "x").replace("×", "x")
+    parts = raw.split("x")
+    if len(parts) == 2:
+        try:
+            w, h = int(float(parts[0])), int(float(parts[1]))
+            if w > 0 and h > 0:
+                return f"{w}x{h}"
+        except ValueError:
+            pass
+
+    ratio = str(body.get("aspect_ratio") or body.get("ratio") or "16:9").replace("：", ":")
+    try:
+        rw, rh = (float(x) for x in ratio.split(":"))
+    except Exception:
+        rw, rh = 16.0, 9.0
+    if rw <= 0 or rh <= 0:
+        rw, rh = 16.0, 9.0
+
+    long = VIDEO_LONG_SIDE.get(str(body.get("resolution") or "").lower(), 1344)
+    f = rw / rh
+    w, h = (long, long / f) if f >= 1 else (long * f, long)
+    return f"{_align16(w)}x{_align16(h)}"
+
+
 def submit_video(body):
+    """
+    提交视频任务。
+
+    和图片生成共用一把串行闸：提交动作本身很快（真正干活的是子进程），
+    但它会**卸载图片管线**给视频腾显存 —— 如果此刻正有一张图在采样，
+    卸载就等于把它的权重从脚底下抽走。排队 0–90 秒换一个「两边都不失败」，值得。
+    """
+    with LEASE.image_lock:
+        return _submit_video_locked(body)
+
+
+def _submit_video_locked(body):
     job_id = uuid.uuid4().hex[:12]
     status_file = STATUS / f"{job_id}.json"
     status_file.write_text(
         json.dumps({"status": "queued", "progress": 0, "created": time.time()}), "utf-8"
     )
 
+    # 别名表也现取：`h3` 这类短名要指向**当前可加载的那份**，
+    # 而不是启动那一刻 env 写的那个（可能还不存在）。
+    _v = video_model()
+    if not _video_ready(_v):
+        # 直说「权重没齐」比让 diffusers 抛一个认不出目录的错好查得多。
+        # 配置检测里那行「下载中 x%」才是用户该看的东西。
+        got = _dir_bytes(_v) / 1024 ** 3 if os.path.isdir(_v) else 0
+        raise RuntimeError(
+            f"视频权重未就绪：{_v or '未找到'} 现有 {got:.1f} GB，需要 {VIDEO_MIN_BYTES / 1024 ** 3:.1f} GB"
+            "（在「模型配置」里把视频模型下完，或 bash deploy/bootstrap.sh models video）"
+        )
     alias = {
-        "h3": VIDEO_MODEL, "minimax": VIDEO_MODEL, "minimax-h3": VIDEO_MODEL,
-        "minimax-h3-base": VIDEO_MODEL, "h3-base": VIDEO_MODEL, "video": VIDEO_MODEL,
+        "h3": _v, "minimax": _v, "minimax-h3": _v,
+        "minimax-h3-base": _v, "h3-base": _v, "video": _v,
     }
-    model = _resolve_repo(body.get("model"), VIDEO_DEFAULT, alias)
+    model = _resolve_repo(body.get("model"), _v or VIDEO_DEFAULT, alias)
 
     args = [
         sys.executable, _worker_path(),
@@ -445,13 +543,24 @@ def submit_video(body):
         "--port", str(PORT), "--model", model,
         "--prompt", body.get("prompt") or "",
         "--duration", str(body.get("duration") or body.get("seconds") or 5),
-        "--size", str(body.get("size") or body.get("resolution") or ""),
+        "--size", _video_size(body),
         "--backend", str(body.get("backend") or VIDEO_BACKEND),
         "--variant", str(body.get("variant") or "auto"),
         "--steps", str(body.get("steps") or 0),
     ]
     if body.get("seed") not in (None, ""):
         args += ["--seed", str(body["seed"])]
+
+    unsupported = []
+    tail = body.get("last_frame") or body.get("tail_image")
+    if isinstance(tail, str) and tail.startswith("data:"):
+        tp = OUT / f"tail_{job_id}.png"
+        _decode_data_url(tail).save(tp)
+        args += ["--last-frame", str(tp)]
+        if not VIDEO_LAST_FRAME:
+            # 收下这张图是为了「日志里能证明客户端确实发过来了」，
+            # 但这条链路用不上它 —— 回执里说清楚，客户端会把它挂成一条可见提示。
+            unsupported.append("last_frame")
 
     imgs = body.get("image")
     if isinstance(imgs, str):
@@ -476,7 +585,11 @@ def submit_video(body):
         log(f"视频任务 {job_id} 进程结束（exit={proc.returncode}）")
 
     threading.Thread(target=reap, daemon=True).start()
-    return {"id": job_id, "status": "queued", "model": model, "created": int(time.time())}
+    return {
+        "id": job_id, "status": "queued", "model": model, "created": int(time.time()),
+        # 客户端拿它决定「要不要在卡片上留一条提示」：请求里带了、后端用不上的部分
+        "unsupported": unsupported,
+    }
 
 
 def video_status(job_id):
@@ -583,6 +696,81 @@ def _has_weights(path_str):
         return False
 
 
+# 视频权重可以**在服务跑着的时候**出现在盘上（网页「模型配置」里的下载按钮
+# 就是由宿主进程下的，34 GB 落盘要一两个小时）。所以「用哪个目录」不能是
+# 启动时算一次就定死的常量：
+#   · 以前 VIDEO_MODEL 直接取自 env，而下权重之前根本不存在那个目录；
+#   · 更要命的是 run.sh 曾在没装时兜底 export 一条**不存在**的路径，
+#     于是下完 34 GB、重启 also 白搭 —— env 会一直把它按回复位到那条空路径。
+# 现在每次要用的时候现问一遍：env 指的目录**真能加载**就用它，否则按 run.sh
+# 的同一套判据扫盘（系统盘优先，再云盘）。扫到就立刻生效，不用重启服务。
+_VIDEO_SCAN = {"at": 0.0, "path": ""}
+_VIDEO_SCAN_TTL = 10.0
+
+# 视频权重的**体积门槛**（GB）。
+#
+# `_has_weights()` 只看入口文件在不在 —— 对「配置级」判断够了，对视频不够：
+# H3-NF4 的 `configuration.json` 只有 34 字节，下载器最先落盘的就是它，
+# 34 GB 的分片要下一两个小时。这中间按入口文件判，`/healthz` 会一路报
+# `caps.video = ready`，用户点「生成视频」才炸 —— 又是一次假绿。
+#
+# 34.4 GB × 0.85 = 29.2 GB，和宿主 `packStatus()` 的 85% 兜底判据取同一个数，
+# 两边才不会出现「面板说齐了、引擎说没有」。
+VIDEO_MIN_BYTES = int(float(os.environ.get("YJ_VIDEO_MIN_GB", "29.2")) * 1024 ** 3)
+
+
+def _dir_bytes(p: str, limit: int = 0) -> int:
+    """目录总字节。给了 `limit` 就够数即停，别为了一个健康检查把 34 GB 全走一遍。"""
+    total = 0
+    for root, _dirs, files in os.walk(p):
+        for fn in files:
+            try:
+                total += os.path.getsize(os.path.join(root, fn))
+            except OSError:
+                pass
+            if limit and total >= limit:
+                return total
+    return total
+
+
+def _video_ready(p: str) -> bool:
+    """能真的加载：入口文件在，**并且**权重大体齐了。"""
+    return _has_weights(p) and _dir_bytes(str(p), VIDEO_MIN_BYTES) >= VIDEO_MIN_BYTES
+
+
+def _scan_video_dirs():
+    """按 `run.sh pick_video` 的判据扫盘，返回第一个**能加载**的视频权重目录。"""
+    for base in (
+        os.environ.get("YJ_LOCAL_MODELS", "/root/models"),
+        os.environ.get("YJ_CLOUD_MODELS", "/root/cloud/models"),
+    ):
+        try:
+            names = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for name in names:
+            if not name.startswith("MiniMax-H3"):
+                continue
+            d = os.path.join(base, name)
+            sub = os.path.join(d, "FL2VA")
+            if _video_ready(sub):
+                return sub
+            if _video_ready(d):
+                return d
+    return ""
+
+
+def video_model():
+    """当前该用的视频权重：env 有效就用 env，否则现扫一遍盘，扫不到再回仓库 id。"""
+    if _video_ready(VIDEO_MODEL):
+        return VIDEO_MODEL
+    now = time.time()
+    if now - _VIDEO_SCAN["at"] > _VIDEO_SCAN_TTL:
+        _VIDEO_SCAN["at"] = now
+        _VIDEO_SCAN["path"] = _scan_video_dirs()
+    return _VIDEO_SCAN["path"] or VIDEO_MODEL
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "yj-model-server/2.0"
@@ -622,15 +810,13 @@ class Handler(BaseHTTPRequestHandler):
                 # 判能力本身就是脆的：文件在也不代表权重在。
                 # image 以前直接写死 "ready"，同理改成真看目录。
                 "image": "ready" if _has_weights(IMAGE_MODEL) else "missing",
-                "video": "ready" if (
-                    _has_weights(VIDEO_DEFAULT) or _has_weights(VIDEO_MODEL)
-                ) else "missing",
+                "video": "ready" if _video_ready(video_model()) else "missing",
             }
             return self._json(200, {
                 "ok": True, "mode": MODE, "caps": caps, "vram": LEASE.stats(),
                 "models": {
-                    "image": IMAGE_MODEL, "video": VIDEO_MODEL,
-                    "video_default": VIDEO_DEFAULT,
+                    "image": IMAGE_MODEL, "video": video_model(),
+                    "video_default": video_model() or VIDEO_DEFAULT,
                     "image_steps": IMAGE_STEPS,
                     "image_max_side": IMAGE_MAX_SIDE, "image_offload": IMAGE_OFFLOAD,
                 },
@@ -641,7 +827,7 @@ class Handler(BaseHTTPRequestHandler):
                 "object": "list",
                 "data": [
                     {"id": IMAGE_MODEL, "object": "model", "owned_by": "local", "kind": "image"},
-                    {"id": VIDEO_MODEL, "object": "model", "owned_by": "local", "kind": "video"},
+                    {"id": video_model(), "object": "model", "owned_by": "local", "kind": "video"},
                     {"id": os.environ.get("YJ_TEXT_MODEL", "Qwen3-8B-Instruct"),
                      "object": "model", "owned_by": "local", "kind": "chat"},
                 ],
@@ -765,7 +951,7 @@ def main():
     log(f"产物目录 {OUT}")
     log(f"文本 {TEXT_UPSTREAM} / 语音 {VOICE_BASE}")
     log(f"图片 {IMAGE_MODEL}（{IMAGE_STEPS} 步 / 长边 {IMAGE_MAX_SIDE}px / offload={IMAGE_OFFLOAD}）")
-    log(f"视频 {VIDEO_MODEL}（backend={VIDEO_BACKEND}，只有 H3 一个后端）")
+    log(f"视频 {video_model() or '未安装（权重装了会自动生效，不用重启）'}（backend={VIDEO_BACKEND}，只有 H3 一个后端）")
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try:
         srv.serve_forever()
