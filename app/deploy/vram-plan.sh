@@ -5,11 +5,12 @@
 #   bash deploy/vram-plan.sh --json    给脚本消费
 #   bash deploy/vram-plan.sh --want   只输出 bootstrap 要的 key（空格分隔）
 #
-# 为什么需要它：视频只有 MiniMax-H3 一个后端（Wan 已移除），而 H3 有两套完全不同的形态 ——
+# 为什么需要它：视频主档是 MiniMax-H3，而 H3 有两套完全不同的形态 ——
 # 官方 bf16 全量 171 GB 权重 / 125 GB 显存（除了 8 卡机器谁都别想）；
 # DiffSynth 的 NF4 量化包只收 FL2VA 那一路时 **34.4 GB 权重**，
 # 官方 README 的口径是「最低 8 G 显存即可运行」（靠 disk offload）。
 # 所以 24 GB 的 4090 是**能出片的**，但 bf16 全量下到盘上纯属白占一百多 G。
+# 显存 ≤12 G 时改用 Wan2.2-TI2V-5B 低显存档（GGUF Q4 3.4 GB + 蒸馏 4 步）。
 # 判据取**单卡最大显存**，不取求和：这套推理是按「一个管线放一张卡」写的，
 # 不会把 H3 的层切到两张卡上，所以 2×24 GB 的机器也不等于能跑 48 GB 的模型。
 set -uo pipefail

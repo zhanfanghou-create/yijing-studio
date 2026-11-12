@@ -315,8 +315,9 @@ cmd_models() {
   load_env
   local want="${1:-auto}"
   # auto = 按这台机器**实际显存**决定下哪些（deploy/vram-plan.sh）。
-  # 视频只有 H3 一个后端，默认那份是 NF4 量化版（只收 FL2VA 四件 = 34.4 GB，
-  # 官方口径最低 8 G 显存就能跑）。bf16 全量要 125 G 显存，`all` 里绝不该带上它。
+  # 视频分两档：H3 全量（NF4 量化只收 FL2VA 四件 = 34.4 GB，官方口径最低 8 G 显存）
+  # 与 Wan2.2-TI2V-5B 低显存档（GGUF Q4 + 蒸馏 4 步，12 G 卡可跑）。
+  # bf16 全量要 125 G 显存，`all` 里绝不该带上它。
   if [ "$want" = "auto" ]; then
     if [ -x "$ROOT/deploy/vram-plan.sh" ] || [ -f "$ROOT/deploy/vram-plan.sh" ]; then
       want="$(bash "$ROOT/deploy/vram-plan.sh" --want 2>/dev/null | tr -d '\r')"
@@ -341,7 +342,7 @@ cmd_models() {
   say "  文本  Qwen3-8B-Instruct            ~16 GB"
   say "  语音  Qwen3-TTS-1.7B × 3           ~13 GB"
   say "  ─────────────────────────────────────────────"
-  say "  该装哪些由显存决定（deploy/vram-plan.sh）；视频只有 H3，NF4 是默认那份。"
+  say "  该装哪些由显存决定（deploy/vram-plan.sh）；视频默认 H3 的 NF4 档，小显存可换 Wan2.2。"
 
   YJ_WANT="$want" YJ_MODEL_DIR="$dir" YJ_VOICE_DIR="$ROOT/vendor/voice/data/models" \
   "$py" - <<'PY'

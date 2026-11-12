@@ -63,10 +63,15 @@ YJ_MODEL_DIR="${YJ_MODEL_DIR:-/root/models}"
 export YJ_INSTALL_ROOT="${YJ_INSTALL_ROOT:-$YJ_MODEL_DIR}"
 export YJ_PORT="${YJ_MODEL_PORT:-3911}"
 export YJ_MODEL_DATA="${YJ_MODEL_DATA:-/root/cloud/model-data}"
+# 显存/线程两条硬线（deploy/vram_guard.py）与空闲自动释放：
+#   超预算时宁可这次任务报错，也不许 Windows 的 CUDA 系统内存回退把整机拖死
+#   （实测 1024² 峰值 21 GB / 卡上 12 GB，机器卡到鼠标不动）。
+#   空闲 180 秒没人用就把权重还给系统，别一直占着显存和内存。
+export YJ_VRAM_FRACTION="${YJ_VRAM_FRACTION:-0.88}"
+export YJ_IDLE_UNLOAD_S="${YJ_IDLE_UNLOAD_S:-180}"
 export YJ_IMAGE_MODEL="${YJ_IMAGE_MODEL:-$(pick_model Qwen-Image-2.1)}"
-# 视频**只有 MiniMax H3 一个后端**（Wan 那条降级档已移除，产品上明确不要）。
-#
-# H3 有两种落盘形态，两者目录结构完全不同，指错了 loader 会报「认不出这个目录」：
+# 视频有两档后端：H3（全量，默认）与 Wan2.2-TI2V-5B（低显存 GGUF，12 G 卡可跑）。
+# 由 `pick_video` 按盘上实际装了哪份决定，两者目录结构与采样参数完全不同 ——
 #
 #   A. 官方 diffusers 仓库 `MiniMaxAI/MiniMax-H3`：根下只有 FL2VA / Ref2VA 两个分区，
 #      `model_index.json` 在分区里 → 必须指到 `<root>/FL2VA` 这一层。

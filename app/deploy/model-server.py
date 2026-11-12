@@ -68,19 +68,35 @@ IMAGE_MODEL = os.environ.get("YJ_IMAGE_MODEL", "Qwen/Qwen-Image-2.1")
 # 那样 VIDEO_MODEL 变成空路径，`_has_weights('')` 会去 stat 当前目录 —— 一个假的绿。
 _VIDEO_ENV = os.environ.get("YJ_VIDEO_MODEL", "").strip()
 VIDEO_MODEL = _VIDEO_ENV or "MiniMaxAI/MiniMax-H3"
-# 视频**只有 H3 一个后端**。以前这里有第二个档（Wan2.2-TI2V-5B，作为小显存机器的
-# 降级），产品上明确不要了：与其维护两套采样参数、两套帧率（H3 24fps / Wan 16fps）、
-# 两套尺寸归一化，不如只留一条链路，硬件不够就直说硬件不够。
+# 视频后端按显存分两档，**不静默降级**：
 #
-# H3 的真实胃口（实测）：bf16 权重 125 GB（DiT 62 + Qwen3-VL 编码器 63），
-# 官方 NF4 版约 42 GB 但仍需 30–36 GB 显存。也就是说**单卡 24 GB 跑不了**，
-# 48 GB 是起步线。显存不够时这里不会静默降级到别的模型，而是让请求失败 ——
+#   H3      —— 全量档。实测 bf16 权重 125 GB（DiT 62 + Qwen3-VL 编码器 63），
+#              官方 NF4 版约 42 GB 但仍需 30–36 GB 显存。单卡 24 GB 跑不了，
+#              48 GB 是起步线。
+#   Wan2.2  —— 低显存档（GGUF Q4_K_M 3.4 GB + 蒸馏 4 步），12 GB 卡可跑。
+#              走 `deploy/wan_worker.py` 独立子进程，退出即释放显存。
+#
+# 选哪个由盘上装了哪份权重决定（`video_model()`），选了装不上的会明确失败 ——
 # 「悄悄换了个模型出片」比「直接告诉我不够」有害得多。
 VIDEO_DEFAULT = os.environ.get("YJ_VIDEO_DEFAULT", "").strip() or VIDEO_MODEL
 VIDEO_BACKEND = os.environ.get("YJ_VIDEO_BACKEND", "auto")
 IMAGE_STEPS = int(os.environ.get("YJ_IMAGE_STEPS", "28"))
 IMAGE_MAX_SIDE = int(os.environ.get("YJ_IMAGE_MAX_SIDE", "1536"))
+# 低显存档的出图长边。1024² 在 12 GB 卡上实测峰值 21 GB（激活值 + 注意力），
+# 超出部分会被 Windows 的 CUDA 系统内存回退吞掉 → 整机分页 → 鼠标都不动。
+# 768² 面积只有 1024² 的 56%，激活值同比降，能稳稳落在预算内。
+IMAGE_SMALL_SIDE = int(os.environ.get("YJ_IMAGE_SMALL_SIDE", "768"))
 IMAGE_OFFLOAD = os.environ.get("YJ_IMAGE_OFFLOAD", "1") != "0"
+# 低显存档的 offload 口径与全量档不同：编码器 17 GB 整块搬不上 12 GB 卡，
+# 默认按 block 分组过（见 `_group_offload_text_encoder`）。设 1 可强制走整组件搬运，
+# 只在大显存机器上才有意义（例如 48 GB，整块搬反而更快）。
+IMAGE_OFFLOAD_WHOLE = os.environ.get("YJ_IMAGE_OFFLOAD_WHOLE", "0") == "1"
+# 空闲多久把权重彻底还给系统（秒）。0 = 永不自动卸载。
+# 分级释放，不是一个数：
+#   每次生成结束 → 立刻把 DiT/VAE 挪回内存，显存归零（秒级，下次只花几秒搬回来）
+#   空闲超过这个值 → 连内存一起还（管线对象整个丢掉，下次要重新加载 3-5 分钟）
+# 默认 180 秒：一次创作里连续出图不会踩到重新加载，放下不管了就把机器还回去。
+IDLE_UNLOAD_S = int(os.environ.get("YJ_IDLE_UNLOAD_S", "180"))
 MODE = os.environ.get("YJ_MODE", "full")
 
 for d in (OUT, STATUS):
@@ -119,6 +135,152 @@ class Lease:
         self.image_lock = threading.Lock()
         self.image_pipe = {"key": None, "pipe": None, "kind": None}
         self.voice_evicted = False
+        # 分级释放的记账：用于「用完就把显存还回去」和空闲超时深度卸载
+        self.image_used_at = 0.0
+        self.image_offloaded = False
+        self.unloads = 0
+        self._watcher = None
+
+    # ---- 空闲守护
+
+    def start_idle_watcher(self):
+        """后台线程：空闲超 IDLE_UNLOAD_S 就把权重彻底还给系统。
+
+        为什么要有这个：本机 31.8 GB 内存，图片管线常驻是
+        （Qwen3-VL-8B 编码器 17.5 GB + DiT 4.2 GB + 杂项）≈ 22 GB。
+        用户「用完就不管了」是常态，让它一直占着 22 GB 内存 + 4.5 GB 显存，
+        整台机器就别想干别的了 —— 实测会让操作系统开始分页，鼠标都卡。
+        """
+        if IDLE_UNLOAD_S <= 0 or self._watcher is not None:
+            return None
+
+        def loop():
+            while True:
+                time.sleep(min(10, max(2, IDLE_UNLOAD_S // 6)))
+                try:
+                    if not self.image_pipe["pipe"]:
+                        continue
+                    idle = time.time() - self.image_used_at
+                    if idle < IDLE_UNLOAD_S:
+                        continue
+                    if self.holder is not None:
+                        continue  # 正在用，跳过
+                    if not self.image_lock.acquire(blocking=False):
+                        continue  # 有请求在排队，别抢锁
+                    try:
+                        log(f"空闲 {idle:.0f}s ≥ {IDLE_UNLOAD_S}s，释放图片模型（显存 + 内存）")
+                        self.unload_image(why=f"空闲 {idle:.0f}s")
+                    finally:
+                        self.image_lock.release()
+                except Exception as e:  # noqa: BLE001
+                    log("空闲卸载线程异常（继续跑）", repr(e))
+
+        self._watcher = threading.Thread(target=loop, name="idle-unload", daemon=True)
+        self._watcher.start()
+        log(f"空闲自动卸载已启用：{IDLE_UNLOAD_S}s 无人使用就释放权重")
+        return self._watcher
+
+    def touch(self, kind="image"):
+        self.image_used_at = time.time()
+        if kind == "image":
+            self.image_offloaded = False
+
+    # ---- 分级释放
+
+    @staticmethod
+    def _image_modules(pipe):
+        """管线里所有**真正占显存**的子模块。
+
+        不能写死 `("transformer", "vae", "text_encoder")`：Qwen-Image 的骨干叫
+        `transformer`，SDXL 的叫 `unet`，编码器也分 `text_encoder` / `text_encoder_2`。
+        漏掉的那个会一直趴在显存里 —— 表现为「点了释放、nvidia-smi 还占 5 GB」。
+        """
+        out = []
+        for attr in (
+            "transformer",
+            "unet",
+            "vae",
+            "text_encoder",
+            "text_encoder_2",
+            "image_encoder",
+        ):
+            mod = getattr(pipe, attr, None)
+            if mod is not None:
+                out.append(mod)
+        return out
+
+    def offload_image(self, why=""):
+        """把图片管线搬回内存：显存立刻归零，内存还留着（下次几秒就能用）。
+
+        注意不能只丢引用：`enable_model_cpu_offload` 会给模块挂 accelerate hook，
+        丢引用而模块还被 hook 抓着的话，显存不会真的回来。
+        """
+        pipe = self.image_pipe.get("pipe")
+        if pipe is None:
+            return False
+        try:
+            for mod in self._image_modules(pipe):
+                try:
+                    mod.to("cpu")
+                except Exception:
+                    pass
+        except Exception as e:  # noqa: BLE001
+            log("搬回内存时出错（继续释放）", repr(e))
+        self.free()
+        self.image_offloaded = True
+        if why:
+            log(f"图片权重已退出显存（{why}），内存保留")
+        return True
+
+    def unload_image(self, why=""):
+        """彻底卸载图片管线：显存和内存一起还。下次请求要重新加载。"""
+        pipe = self.image_pipe.get("pipe")
+        if pipe is None:
+            return False
+        # 先摘 hook 再丢引用，否则 accelerate 的 hook 会吊着模块不放
+        try:
+            for mod in self._image_modules(pipe):
+                try:
+                    from accelerate.hooks import remove_hook_from_module  # noqa: PLC0415
+
+                    remove_hook_from_module(mod, recurse=True)
+                except Exception:
+                    pass
+                try:
+                    mod.to("cpu")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self.image_pipe = {"key": None, "pipe": None, "kind": None}
+        self.image_offloaded = False
+        self.unloads += 1
+        try:
+            del pipe
+        except Exception:
+            pass
+        self.free()
+        torch = self.torch()
+        if torch is not None:
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        if why:
+            log(f"图片模型已卸载（{why}）")
+        return True
+
+    def image_state(self):
+        loaded = self.image_pipe.get("pipe") is not None
+        idle = round(time.time() - self.image_used_at, 1) if self.image_used_at else None
+        return {
+            "loaded": loaded,
+            "offloaded": bool(self.image_offloaded),
+            "key": self.image_pipe.get("key"),
+            "idleSeconds": idle,
+            "idleUnloadSeconds": IDLE_UNLOAD_S,
+            "unloads": self.unloads,
+        }
 
     # ---- torch 工具
 
@@ -144,7 +306,7 @@ class Lease:
     def stats(self):
         torch = self.torch()
         if torch is None or not torch.cuda.is_available():
-            return {"gpu": None, "holder": self.holder}
+            return {"gpu": None, "holder": self.holder, "image": self.image_state()}
         free, total = torch.cuda.mem_get_info()
         return {
             "gpu": torch.cuda.get_device_name(0),
@@ -152,6 +314,7 @@ class Lease:
             "totalMB": round(total / 1048576),
             "usedMB": round((total - free) / 1048576),
             "holder": self.holder,
+            "image": self.image_state(),
         }
 
     # ---- 语音让位（跨进程）
@@ -184,7 +347,18 @@ class Lease:
             if kind == "video":
                 if self.holder == "image":
                     log("卸载图片（给视频腾显存）")
-                    self.image_pipe = {"key": None, "pipe": None, "kind": None}
+                # 无条件走 `unload_image()`，不看 holder。
+                #
+                # 以前这里写的是 `if self.holder == "image": self.image_pipe = {...}`
+                # 两条都错：
+                #   1. 出图结束后 `release("image")` 已经把 holder 置成 None，
+                #      所以这个分支**从来不执行** —— SDXL 的 6.5 GB 原地不动；
+                #   2. 就算执行，只丢引用不摘 accelerate hook，显存和内存都不会真的
+                #      还回来（offload_image 的注释里就写了这一条）。
+                # 后果：视频 worker 加载 Wan（约 17 GB）时系统内存只剩 2 GB，
+                # 卡在「Loading pipeline components 4/5」十几分钟不动，
+                # 看起来像死锁，其实是内存不够在换页。
+                self.unload_image(why="让出内存给视频")
                 self.voice_evicted = self._voice_unload()
                 self.free()
             elif kind == "image":
@@ -220,7 +394,9 @@ RATIOS = {
 
 
 def _round16(v):
-    return max(256, int(round(v / 16.0)) * 16)
+    # 显式 floor(v/16 + 0.5)：Python 的 round 是银行家舍入，和 JS 的 Math.round 在
+    # 恰好 .5 时差一档（42.5 → 42 vs 43）。图像这条链两端都会算这个数，别让它分叉。
+    return max(256, int(v / 16.0 + 0.5) * 16)
 
 
 def _size_for(ratio, long_side):
@@ -279,6 +455,77 @@ def _pick_image_class():
     raise RuntimeError("当前 diffusers 里没有 Qwen-Image 的 pipeline，请 pip install -U diffusers")
 
 
+def _load_gguf_transformer(gguf_path: Path, torch, model_dir: Path | None = None):
+    """把 GGUF 量化权重读成一个 transformer 对象。
+
+    这是低显存档的核心：Q4_K_M 只有 bf16 的 1/3 体积（4.2 GB vs 14.2 GB），
+    在 12 GB 卡上能整块放进显存，剩下只留给激活值和 VAE。
+
+    **必须传 `config=`**：不传的话 diffusers 会拿默认仓库名去 Hub 上找 config.json，
+    离线机器上会报「does not appear to have a file named config.json」——
+    看着像权重坏了，其实是它在找一份本地早就有的配置。同理要先读本地配置里的
+    `_class_name` 再决定用哪个类（2.1 是 `QwenImage21Transformer2DModel`，
+    用 1.x 的类去装会静默按错误的层数构造，报错点离真正原因很远）。
+    """
+    from diffusers import GGUFQuantizationConfig  # noqa: PLC0415
+
+    import diffusers  # noqa: PLC0415
+
+    cfg_dir = Path(model_dir) / "transformer" if model_dir else None
+    want = ""
+    if cfg_dir and (cfg_dir / "config.json").is_file():
+        try:
+            want = str(json.loads((cfg_dir / "config.json").read_text("utf-8")).get("_class_name") or "")
+        except Exception:
+            want = ""
+
+    names = []
+    if want:
+        names.append(want)
+    names += ["QwenImage21Transformer2DModel", "QwenImageTransformer2DModel"]
+    cands = []
+    for name in names:
+        c = getattr(diffusers, name, None)
+        if c is not None and c not in cands:
+            cands.append(c)
+    if not cands:
+        raise RuntimeError("当前 diffusers 没有 Qwen-Image 的 transformer 类，无法加载 GGUF")
+
+    err: Exception | None = None
+    for cls in cands:
+        try:
+            kw = {}
+            if cfg_dir and (cfg_dir / "config.json").is_file():
+                kw["config"] = str(cfg_dir)
+            model = cls.from_single_file(
+                str(gguf_path),
+                quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
+                torch_dtype=torch.bfloat16,
+                **kw,
+            )
+            # diffusers 会把一维 BF16 张量按字节数建参数（4096 → 8192），
+            # 不修就在第一次前向炸在 text_norm 上。详见 deploy/gguf_fix.py
+            try:
+                from gguf_fix import repair_bf16_1d  # noqa: PLC0415
+
+                repair_bf16_1d(model, gguf_path, log=log)
+            except Exception as e:  # noqa: BLE001
+                log("GGUF BF16 修补没跑起来", repr(e))
+            # 社区 GGUF 把 SwiGLU 的 gate/up 融合成一键，diffusers 要两个 Linear。
+            # 不拆的话每个 block 的 MLP 保持随机初始化 —— 不报错，只吐噪声图。
+            try:
+                from gguf_fix import split_fused_mlp, verify_keys  # noqa: PLC0415
+
+                split_fused_mlp(model, gguf_path, log=log)
+                verify_keys(model, gguf_path, log=log)
+            except Exception as e:  # noqa: BLE001
+                log("GGUF 融合 MLP 拆分没跑起来", repr(e))
+            return model
+        except Exception as e:  # noqa: BLE001
+            err = e
+    raise RuntimeError(f"GGUF 加载失败（{gguf_path.name}）：{err}")
+
+
 def _load_image_pipe(kind, model_id):
     """kind: edit（有参考图）| text（纯文生图）。2.1 是同一个权重做两件事。"""
     key = f"{kind}:{model_id}"
@@ -299,20 +546,46 @@ def _load_image_pipe(kind, model_id):
         gc.collect()
         torch.cuda.empty_cache()
 
-    log(f"加载 {model_id}（{name}, {kind}）—— 首次 1-3 分钟，之后常驻")
+    # 低显存档：目录里有 .gguf 就走量化加载（权重只占 4.2 GB）
+    target = str(model_id)
+    gguf = None
+    if Path(target).is_dir():
+        gguf = _gguf_in(Path(target))
+    if gguf is None:
+        small = small_image_dir()
+        if small:
+            target = small
+            gguf = _gguf_in(Path(small))
+
+    log(f"加载 {target}（{name}, {kind}{', GGUF ' + gguf.name if gguf else ''}）—— 首次 1-3 分钟，之后常驻")
 
     t0 = time.time()
-    kwargs = {"torch_dtype": torch.bfloat16}
-    try:
-        pipe = cls.from_pretrained(model_id, **kwargs)
-    except Exception:
-        # 老版本 diffusers 不认 torch_dtype，退回 fp16 的写法
-        kwargs["torch_dtype"] = torch.float16
-        pipe = cls.from_pretrained(model_id, **kwargs)
+    if gguf is not None:
+        transformer = _load_gguf_transformer(gguf, torch, Path(target))
+        pipe = cls.from_pretrained(target, transformer=transformer, torch_dtype=torch.bfloat16)
+    else:
+        kwargs = {"torch_dtype": torch.bfloat16}
+        try:
+            pipe = cls.from_pretrained(target, **kwargs)
+        except Exception:
+            # 老版本 diffusers 不认 torch_dtype，退回 fp16 的写法
+            kwargs["torch_dtype"] = torch.float16
+            pipe = cls.from_pretrained(target, **kwargs)
 
-    if IMAGE_OFFLOAD:
-        # 关键：Qwen3-VL-8B 文本编码器占 17.5 GB，编码完前几步就不再需要。
-        # offload 把它挪回内存，峰值从 ~40 GB 降到 ~22 GB —— 这是能和语音共存的原因。
+    if gguf is not None and not IMAGE_OFFLOAD_WHOLE:
+        # 低显存档**不能**用 `enable_model_cpu_offload()`：
+        # 它是整组件搬运，而 Qwen3-VL-8B 编码器 bf16 就有 17.5 GB ——
+        # 比整张 12 GB 卡还大，搬上去必 OOM。
+        # 只对编码器做 block 分组，DiT / VAE **先留在内存**：
+        # 上卡时机交给 `_generate_small` 的两段式（编码时 DiT 不在卡上，
+        # 编完卸编码器、再让 DiT 上卡）。在这里提前上卡会立刻顶穿预算。
+        _group_offload_text_encoder(pipe, torch)
+        try:
+            pipe.vae.enable_tiling()
+        except Exception:
+            pass
+    elif IMAGE_OFFLOAD:
+        # 全量权重档：Qwen3-VL-8B 编码器编码完就不再需要，offload 把它挪回内存。
         pipe.enable_model_cpu_offload()
     else:
         pipe.to("cuda")
@@ -323,7 +596,74 @@ def _load_image_pipe(kind, model_id):
 
     log(f"图片模型就绪，{time.time() - t0:.1f}s")
     LEASE.image_pipe.update({"key": key, "pipe": pipe, "kind": kind})
+    LEASE.touch("image")
     return pipe
+
+
+def _group_offload_text_encoder(pipe, torch) -> None:
+    """低显存档的文本编码器摆放策略。
+
+    实测结论（12 GB 卡 + Qwen3-VL-8B 17.5 GB bf16 编码器）：
+
+      block_level 分组  → 编码阶段就 OOM（10.42/10.55 GiB）。
+        非分组部分（embed_tokens 1.2 GB + visual 塔 + 各 block 的 norm）
+        由根 hook 一起 onload，光常驻就吃满预算，DiT 还没上卡就没地方了。
+      leaf_level        → 峰值能压住，但每个算子一次 PCIe 往返，
+        750 个张量编码一次要几分钟，产品上不能用。
+      **CPU 编码**       → 显存零占用，代价是一次 prompt 几十秒。
+        17.5 GB 权重放进 31.8 GB 内存是够的，且编码只做一次。
+
+    所以默认走 CPU 编码（`YJ_TE_DEVICE=cpu`），大显存机器可以设 `gpu` 换速度。
+    """
+    mode = os.environ.get("YJ_TE_DEVICE", "cpu").lower()
+    if mode == "gpu":
+        try:
+            from diffusers.hooks import apply_group_offloading  # noqa: PLC0415
+
+            apply_group_offloading(
+                pipe.text_encoder,
+                onload_device=torch.device("cuda"),
+                offload_device=torch.device("cpu"),
+                offload_type="block_level",
+                num_blocks_per_group=1,
+                block_modules=["model.language_model.layers", "model.visual.blocks"],
+            )
+            log("文本编码器按 block 分组 offload（需大显存，12 GB 卡会 OOM）")
+        except Exception as e:  # noqa: BLE001
+            log("分组 offload 不可用，改用 CPU 编码", repr(e))
+            mode = "cpu"
+    if mode != "gpu":
+        try:
+            pipe.text_encoder.to("cpu")
+        except Exception:
+            pass
+        log("文本编码器常驻内存（CPU 编码，显存零占用）")
+
+
+def _park_text_encoder(pipe, torch, log_fn=None) -> None:
+    """编码完就把文本编码器整个退出显存 —— 两段式的关键一步。
+
+    编码器（17 GB）和 DiT（4.2 GB）只有 12 GB 卡，两者不能同时占着。
+    摘掉 hook 再 to("cpu")，否则 accelerate 的 hook 会吊着模块不放，
+    `empty_cache()` 也拿不回那 5.9 GB。
+    """
+    te = getattr(pipe, "text_encoder", None)
+    if te is None:
+        return
+    try:
+        from accelerate.hooks import remove_hook_from_module  # noqa: PLC0415
+
+        remove_hook_from_module(te, recurse=True)
+    except Exception:
+        pass
+    try:
+        te.to("cpu")
+    except Exception:
+        pass
+    torch.cuda.empty_cache()
+    if log_fn:
+        free, total = torch.cuda.mem_get_info()
+        log_fn(f"编码器已退出显存（空闲 {free / 2**30:.1f}/{total / 2**30:.1f} GB）")
 
 
 def _img_kwargs(pipe, body, width, height, steps):
@@ -385,14 +725,329 @@ def generate_image(body):
         return _generate_image_locked(body)
 
 
+def _generate_small(pipe, kw, images):
+    """低显存档的两段式出图：先编码（DiT 不在卡上），再卸编码器、让 DiT 上卡。
+
+    为什么必须分两段：12 GB 卡装不下「编码器常驻 ~5.9 GB + DiT 4.2 GB +
+    去噪激活」。一次性 `pipe(...)` 的结果是实测 OOM（10.37/10.55 GiB 已分配）。
+    拆开后每一段的峰值都落在 7 GB 以内，代价是多一次 `torch.cuda.empty_cache()`。
+    """
+    import torch  # noqa: PLC0415
+
+    dev = torch.device("cuda")
+    # 编码器在 CPU（见 `_group_offload_text_encoder`）：输入的 device 也要给 cpu，
+    # 否则 transformer 的 embedding 在 cpu 上收到 cuda 张量会直接报设备不一致。
+    enc_dev = pipe.text_encoder.device if hasattr(pipe.text_encoder, "device") else torch.device("cpu")
+    prompt = kw.pop("prompt")
+    # CFG=1（蒸馏权重的唯一正确用法）时不走无分类器引导，负面提示词本来就被忽略，
+    # 传了反而让 encode_prompt 多编一遍，白烧几十秒。
+    kw.pop("negative_prompt", None)
+
+    t0 = time.time()
+    embeds, embeds_mask, image_pad_mask = pipe.encode_prompt(
+        prompt, image=images, device=enc_dev, num_images_per_prompt=1
+    )
+    log(f"提示词编码完成 {time.time() - t0:.1f}s（{tuple(embeds.shape)}，设备 {enc_dev}）")
+    # 编完立刻搬到显卡，并让编码器彻底退出显存（CPU 编码时本来就不占，这步是兜底）
+    embeds = embeds.to(dev)
+    if embeds_mask is not None:
+        embeds_mask = embeds_mask.to(dev)
+    image_pad_mask = image_pad_mask.to(dev)
+
+    _park_text_encoder(pipe, torch, log_fn=log)
+
+    pipe.transformer.to("cuda")
+    pipe.vae.to("cuda")
+    try:
+        pipe.vae.enable_tiling()
+    except Exception:
+        pass
+
+    kw["prompt_embeds"] = embeds
+    if embeds_mask is not None:
+        kw["prompt_embeds_mask"] = embeds_mask
+    kw["image_pad_mask"] = image_pad_mask
+    return pipe(**kw).images[0]
+
+
+def _load_sdxl_pipe(kind):
+    """SDXL-Lightning 管线。kind: text（文生图）| edit（图生图）。
+
+    为什么要单开一条而不是塞进 `_load_image_pipe`：两条链没有任何可复用部件 ——
+    单 vs 双文本编码器、MMDiT vs UNet、指令式编码 vs CLIP 池化、CFG 语义也不同。
+    混在一起只会得到「参数被忽略但不报错」这种最难查的问题。
+    """
+    key = f"sdxl:{kind}"
+    if LEASE.image_pipe["key"] == key and LEASE.image_pipe["pipe"] is not None:
+        pipe = LEASE.image_pipe["pipe"]
+        if not IMAGE_OFFLOAD and LEASE.image_offloaded:
+            # 上次出图后被 `Lease.offload_image()` 搬回内存了。全放卡模式没有
+            # accelerate hook 帮忙搬回来，不补这一步的话下一次会在 CPU 上采样
+            # —— 表现是「点了生成，十分钟没反应」。
+            pipe.to("cuda")
+            LEASE.image_offloaded = False
+            log("SDXL 权重搬回显存（上次出图后已释放）")
+        return pipe
+
+    import torch  # noqa: PLC0415
+
+    LEASE.acquire("image")
+    if LEASE.image_pipe["pipe"] is not None:
+        LEASE.image_pipe = {"key": None, "pipe": None, "kind": None}
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    d = Path(sdxl_dir() or SDXL_DIR)
+    ck = _sdxl_ckpt(d)
+    if ck is None:
+        raise RuntimeError(
+            f"{d} 里没有完整的 SDXL checkpoint（需要 ≥6 GB 的 .safetensors）。"
+            "低显存图像档靠它，缺了就只能回落到 Qwen-Image（要 22 GB 内存）。"
+        )
+
+    from diffusers import (  # noqa: PLC0415
+        EulerDiscreteScheduler,
+        StableDiffusionXLImg2ImgPipeline,
+        StableDiffusionXLPipeline,
+    )
+
+    cls = StableDiffusionXLPipeline if kind == "text" else StableDiffusionXLImg2ImgPipeline
+    log(f"加载 SDXL-Lightning {ck.name}（{ck.stat().st_size / 2**30:.2f} GiB, {kind}）")
+
+    t0 = time.time()
+    # config 指向本地目录（从 SDXL base 抄来的各组 config.json）。
+    # 不给的话 diffusers 会去 HF 拉配置，离线部署直接失败。
+    pipe = cls.from_single_file(
+        str(ck),
+        config=str(d),
+        torch_dtype=torch.float16,
+        use_safetensors=True,
+    )
+    # 蒸馏权重的正确采样器：欧拉离散 + trailing 时间步。
+    # 用默认的 DPM 多步 + leading 会让 4 步出图偏糊、偏灰 —— 这不是调参问题，
+    # 是蒸馏时用的就是这个 schedule，错了等于换了采样轨迹。
+    pipe.scheduler = EulerDiscreteScheduler.from_config(
+        pipe.scheduler.config, timestep_spacing="trailing"
+    )
+
+    if IMAGE_OFFLOAD:
+        # 整组件 offload（不是 block 级）：SDXL 最大的组件是 UNet 5 GB，
+        # 12 GB 卡装得下，只是不想让它长期空占。每次请求搬一次，1-2 秒。
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe.to("cuda")
+    for attr, fn in (("vae", "enable_tiling"), ("vae", "enable_slicing")):
+        try:
+            getattr(getattr(pipe, attr), fn)()
+        except Exception:
+            pass
+    try:
+        pipe.set_progress_bar_config(disable=True)
+    except Exception:
+        pass
+
+    log(f"SDXL 就绪，{time.time() - t0:.1f}s")
+    LEASE.image_pipe.update({"key": key, "pipe": pipe, "kind": kind})
+    LEASE.touch("image")
+    return pipe
+
+
+def _warm_translator():
+    """启动后在后台把中译英模型载入内存。
+
+    为什么预热：MarianMT 首次加载 30–40 秒（258 个张量 + tokenizer），
+    以前这段时间全压在用户第一次出图的等待里 —— 现象是「点了生成，
+    一分半没动静」，而显卡一直空着，看起来像卡死。
+    放到服务启动后跑，用户就感觉不到这一层。
+
+    失败不影响服务：`_localize_prompt` 里会再试一次，再失败就按原文提交。
+    """
+    if not (TRANS_DIR / "config.json").is_file():
+        return
+
+    def run():
+        try:
+            from prompt_l10n import preload  # noqa: PLC0415
+
+            t0 = time.time()
+            if preload(str(TRANS_DIR)):
+                log(f"中译英模型已预热（{time.time() - t0:.1f}s）")
+        except Exception as e:  # noqa: BLE001
+            log("中译英预热失败（不影响出图，首次翻译会现加载）", repr(e))
+
+    threading.Thread(target=run, name="warm-translator", daemon=True).start()
+
+
+def _finish_image(out, body):
+    """存盘 + 释放显存。两条图像链路共用的收尾。"""
+    # 原生透明：2.1 的 RGBA VAE 直接出 alpha，保存成 PNG 就带透明底，
+    # 不需要再跑一遍抠图 —— 画布里的贴纸/素材节点要的正是这个。
+    # SDXL 没有 alpha VAE，这里不会误伤（mode 已是 RGB）。
+    if out.mode not in ("RGB", "RGBA"):
+        out = out.convert("RGBA" if body.get("transparent") else "RGB")
+
+    name = f"img_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
+    dest = OUT / name
+    out.save(dest)
+    LEASE.touch("image")
+    LEASE.release("image")
+    # 出图完成就把模型退出显存：一次创作里连续出图时，下次只花几秒搬回来；
+    # 但显存不再被「暂时没人用」的模型占着。内存留着，超时后由守护线程回收。
+    try:
+        LEASE.offload_image(why="出图完成")
+    except Exception as e:  # noqa: BLE001
+        log("出图后释放显存失败（不影响本次结果）", repr(e))
+    return {
+        "created": int(time.time()),
+        "data": [{
+            "url": f"http://127.0.0.1:{PORT}/files/{name}",
+            "size": f"{out.width}x{out.height}",
+            "has_alpha": out.mode == "RGBA" and _has_alpha(out),
+        }],
+    }
+
+
+def _localize_prompt(prompt):
+    """中文提示词转英文。返回 (实际喂给模型的提示词, 是否翻译过)。
+
+    SDXL 的双 CLIP 只认英文：实测同一 pipeline 同一种子，英文 prompt 出「橘猫坐木地板」，
+    中文 prompt 出抽象色块。所以在 SDXL 这条路上必须翻 —— 不能指望用户自己写英文。
+    Qwen-Image 走 Qwen3-VL 编码器，本身懂中文，不经过这里。
+    """
+    try:
+        from prompt_l10n import has_cjk, localize  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        log("提示词本地化模块不可用", repr(e))
+        return prompt, False
+
+    if not has_cjk(prompt):
+        return prompt, False
+
+    d = TRANS_DIR
+    try:
+        ok = (d / "config.json").is_file()
+    except OSError:
+        ok = False
+    if not ok:
+        log(
+            f"提示词是中文，但没装翻译模型（{d}）。SDXL 只认英文，"
+            "这一张的构图会基本不听提示词 —— 建议补装 opus-mt-zh-en（298 MB）"
+        )
+        return prompt, False
+
+    out = localize(prompt, d)
+    if out == prompt:
+        log("中文提示词翻译失败，已按原文提交（画面可能不听提示词）")
+        return prompt, False
+    log(f"提示词已本地化：{prompt[:24]}… → {out[:60]}")
+    return out, True
+
+
+def _sdxl_size(width, height):
+    """SDXL 尺寸归一化：64 对齐 + 上下限。
+
+    SDXL 的 UNet 下采样 64 倍，尺寸必须是 **64 的倍数**（16 的倍数在中间层
+    会对不齐，轻则 shape mismatch，重则出雪花）。`_parse_size` 只对到 16，
+    这里补到 64 —— 720 → 768 这种轻微变形比直接报错好。
+
+    抽成独立函数是为了能单测：这条链上的尺寸问题（「选了 2K 出 1K」）
+    只能靠对账查，不能靠看代码猜。
+    """
+    def one(v):
+        return max(512, min(SDXL_MAX_SIDE, int(round(float(v) / 64.0)) * 64))
+    return one(width), one(height)
+
+
+def _generate_image_sdxl(body, prompt):
+    """SDXL-Lightning 出图。四步蒸馏，CFG 关掉。"""
+    steps = int(body.get("steps") or SDXL_STEPS)
+    # 蒸馏权重超过 8 步只会越来越糊（训练分布就 4 步）。
+    steps = max(1, min(8, steps))
+    width, height = _parse_size(body.get("size"), body.get("ratio") or "1:1", SDXL_MAX_SIDE)
+    raw_w, raw_h = width, height
+    width, height = _sdxl_size(width, height)
+    # 把「收到什么、实际用什么」原样记下来。用户报「参数没生效」时，
+    # 这一行就能区分「没提交上来」还是「提交了但被后端按硬件收窄」。
+    log(
+        f"SDXL 请求参数 size={body.get('size')!r} ratio={body.get('ratio')!r} "
+        f"resolution={body.get('resolution')!r} steps={body.get('steps')!r} "
+        f"→ {width}x{height} / {steps} 步"
+        + ("" if (raw_w, raw_h) == (width, height) else f"（原 {raw_w}x{raw_h} 已按 64 对齐/上限收窄）")
+    )
+
+    en_prompt, translated = _localize_prompt(prompt)
+
+    refs = body.get("image")
+    if isinstance(refs, str):
+        refs = [refs]
+    refs = [r for r in (refs or []) if isinstance(r, str) and r.startswith("data:")]
+    refs = refs[:4]
+
+    kw = {
+        "prompt": en_prompt,
+        "num_inference_steps": steps,
+        # Lightning 官方口径是 0：不做无分类器引导。传 1.0 也接近，但 0 才是
+        # 它蒸馏时的条件 —— 而且 guidance>1 会让每步多算一次 UNet，慢一倍。
+        "guidance_scale": 0.0,
+    }
+
+    if refs:
+        pipe = _load_sdxl_pipe("edit")
+        from PIL import Image  # noqa: PLC0415
+
+        init = _decode_data_url(refs[0]).convert("RGB")
+        if init.size != (width, height):
+            init = init.resize((width, height), Image.LANCZOS)
+        kw["image"] = init
+        # 参考图相似度：0.6 是「听提示词但仍保留构图」的常用值。
+        kw["strength"] = max(0.05, min(0.95, float(body.get("strength") or 0.6)))
+    else:
+        pipe = _load_sdxl_pipe("text")
+        kw["width"], kw["height"] = width, height
+
+    t0 = time.time()
+    out = pipe(**kw).images[0]
+    log(f"SDXL 出图 {out.width}x{out.height} / {steps} 步 / {time.time() - t0:.1f}s")
+    res = _finish_image(out, body)
+    # 把「实际喂了什么」写回响应：用户看到画不对时，第一件要确认的就是
+    # 提示词有没有被翻译、翻成了什么。
+    res["prompt_used"] = en_prompt
+    res["prompt_translated"] = translated
+    return res
+
+
 def _generate_image_locked(body):
     prompt = (body.get("prompt") or "").strip()
     if not prompt:
         raise ValueError("没有提示词")
 
+    # 低显存档分流。SDXL 与 Qwen-Image 没有任何可复用的部件，必须走各自的链。
+    # 判定口径：
+    #   显式要 sdxl → SDXL（没装就明确报错，不静默换模型）
+    #   没指定      → 装了 SDXL 就用 SDXL（这是本机的默认档）
+    #   指定别的    → 走原来的 Qwen 链
+    raw_model = str(body.get("model") or "").strip().lower()
+    if raw_model in SDXL_ALIASES and not sdxl_dir():
+        raise RuntimeError(
+            "选了 SDXL-Lightning，但本地没有完整权重。"
+            f"把 fp16 checkpoint 放到 {SDXL_DIR}（≥6 GB），或改用 qwen-image-2.1。"
+        )
+    if raw_model in SDXL_ALIASES or (not raw_model and sdxl_dir()):
+        return _generate_image_sdxl(body, prompt)
+
     model_id = _resolve_repo(body.get("model"), IMAGE_MODEL)
-    width, height = _parse_size(body.get("size"), body.get("ratio") or "1:1", IMAGE_MAX_SIDE)
-    steps = int(body.get("steps") or IMAGE_STEPS)
+    # 低显存档长边压到 768（见 IMAGE_SMALL_SIDE 注释）：1024² 会顶到 21 GB 峰值
+    max_side = IMAGE_SMALL_SIDE if _is_small(model_id) else IMAGE_MAX_SIDE
+    width, height = _parse_size(body.get("size"), body.get("ratio") or "1:1", max_side)
+
+    # 低显存档是 4–8 步蒸馏权重（Turbo / Lightning）：按 28 步跑不但慢 4 倍，
+    # 还会因为「步数远超训练分布」把画面跑糊。cfg 同理，蒸馏权重只认 1.0。
+    small_img = bool(small_image_dir()) and (
+        not Path(str(model_id)).is_dir() or _is_small(model_id)
+    )
+    if small_img and body.get("guidance") in (None, ""):
+        body = {**body, "guidance": 1.0}
+    steps = int(body.get("steps") or (8 if small_img else IMAGE_STEPS))
 
     refs = body.get("image")
     if isinstance(refs, str):
@@ -404,33 +1059,23 @@ def _generate_image_locked(body):
     if refs:
         pipe = _load_image_pipe("edit", model_id)
         images = [_decode_data_url(r) for r in refs]
-        kw = _img_kwargs(pipe, body, width, height, steps)
+    else:
+        pipe = _load_image_pipe("text", model_id)
+        images = None
+
+    kw = _img_kwargs(pipe, body, width, height, steps)
+    if small_img:
+        out = _generate_small(pipe, kw, images)
+    elif images:
         try:
             out = pipe(image=images if len(images) > 1 else images[0], **kw).images[0]
         except TypeError:
             # 某些版本只认单图直传，退一步只喂第一张
             out = pipe(image=images[0], **kw).images[0]
     else:
-        pipe = _load_image_pipe("text", model_id)
-        out = pipe(**_img_kwargs(pipe, body, width, height, steps)).images[0]
+        out = pipe(**kw).images[0]
 
-    # 原生透明：2.1 的 RGBA VAE 直接出 alpha 通道，保存成 PNG 就带透明底，
-    # 不需要再跑一遍抠图 —— 画布里的贴纸/素材节点要的正是这个。
-    if out.mode not in ("RGB", "RGBA"):
-        out = out.convert("RGBA" if body.get("transparent") else "RGB")
-
-    name = f"img_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
-    dest = OUT / name
-    out.save(dest)
-    LEASE.release("image")
-    return {
-        "created": int(time.time()),
-        "data": [{
-            "url": f"http://127.0.0.1:{PORT}/files/{name}",
-            "size": f"{out.width}x{out.height}",
-            "has_alpha": out.mode == "RGBA" and _has_alpha(out),
-        }],
-    }
+    return _finish_image(out, body)
 
 
 def _has_alpha(img):
@@ -457,6 +1102,15 @@ def _worker_path():
     return str(ROOT / "video_worker.py")
 
 
+def _wan_worker_path():
+    """低显存档的 worker（Wan2.2 + GGUF）。判据同 `_worker_path`：源码或 .pyc 都认。"""
+    for name in ("wan_worker.py", "wan_worker.pyc"):
+        p = ROOT / name
+        if p.is_file():
+            return str(p)
+    return str(ROOT / "wan_worker.py")
+
+
 VIDEO_LONG_SIDE = {"480p": 832, "720p": 1344, "1080p": 1920, "1440p": 2560}
 
 # 尾帧能不能吃，取决于 worker 走哪条路线：
@@ -466,8 +1120,17 @@ VIDEO_LONG_SIDE = {"480p": 832, "720p": 1344, "1080p": 1920, "1440p": 2560}
 VIDEO_LAST_FRAME = True
 
 
-def _align16(v):
-    return max(256, int(round(v / 16.0)) * 16)
+def _align32(v):
+    """视频边长对齐到 32 的倍数。
+
+    Wan 的 patch 是 `2×16×16`，再叠 VAE 16 倍空间压缩 ⇒ 长宽都必须落 32；
+    H3 只要 16。取 32 同时满足两者。
+
+    舍入显式写 `int(v/32 + 0.5)`：Python 的 `round()` 是银行家舍入
+    （14.5 → 14），JS 的 `Math.round` 是向上取半（14.5 → 15）。以前两端各用各的，
+    在 .5 上会错开一档，`832×464` 与 `832×448` 就是这么分叉的。
+    """
+    return max(256, int(v / 32.0 + 0.5) * 32)
 
 
 def _video_size(body):
@@ -476,6 +1139,10 @@ def _video_size(body):
     以前这里把 `resolution`（"720p"）当 size 直接交给 worker，
     `norm_size` 解析不了就退回 1344×768 —— 于是「9:16 竖版」出来的是一张横片，
     而且全程不报错。网页端此前只发 aspect_ratio，正好踩在这条路上。
+
+    两条路径都过 `_align32`：客户端已经对齐过一次，这里再对一次是为了
+    兜住直接打 HTTP 的调用方（以及手工 curl 的 `size=832x464`）——
+    **日志里印的数必须就是模型跑的数**，否则「参数没生效」永远查不清。
     """
     raw = str(body.get("size") or "").strip().lower().replace("*", "x").replace("×", "x")
     parts = raw.split("x")
@@ -483,7 +1150,7 @@ def _video_size(body):
         try:
             w, h = int(float(parts[0])), int(float(parts[1]))
             if w > 0 and h > 0:
-                return f"{w}x{h}"
+                return f"{_align32(w)}x{_align32(h)}"
         except ValueError:
             pass
 
@@ -498,7 +1165,7 @@ def _video_size(body):
     long = VIDEO_LONG_SIDE.get(str(body.get("resolution") or "").lower(), 1344)
     f = rw / rh
     w, h = (long, long / f) if f >= 1 else (long * f, long)
-    return f"{_align16(w)}x{_align16(h)}"
+    return f"{_align32(w)}x{_align32(h)}"
 
 
 def submit_video(body):
@@ -535,10 +1202,17 @@ def _submit_video_locked(body):
         "h3": _v, "minimax": _v, "minimax-h3": _v,
         "minimax-h3-base": _v, "h3-base": _v, "video": _v,
     }
+    # 小模型档的别名：画布下拉里写的是 `wan2.2-ti2v-5b`，
+    # 这个名字必须能落到本地那份 GGUF 目录上，否则选了它只会报「权重未就绪」。
+    if small_video_dir():
+        for k in ("wan2.2-ti2v-5b", "wan2.2", "wan", "wan-ti2v", "ti2v"):
+            alias[k] = small_video_dir()
     model = _resolve_repo(body.get("model"), _v or VIDEO_DEFAULT, alias)
 
+    # 走哪条 worker：小模型档是纯 diffusers + GGUF（Wan），其余是 H3 那套
+    small = _is_small(model)
     args = [
-        sys.executable, _worker_path(),
+        sys.executable, _wan_worker_path() if small else _worker_path(),
         "--job", job_id, "--status", str(status_file), "--out", str(OUT),
         "--port", str(PORT), "--model", model,
         "--prompt", body.get("prompt") or "",
@@ -548,8 +1222,22 @@ def _submit_video_locked(body):
         "--variant", str(body.get("variant") or "auto"),
         "--steps", str(body.get("steps") or 0),
     ]
+    if small:
+        # 显式给 GGUF 路径：目录里可能同时存在多个量化档，选哪个由服务端决定，
+        # 不让 worker 自己猜（猜错就是「加载了 Q2、画面糊成一片」这种无声降质）。
+        g = _gguf_in(Path(small_video_dir()))
+        if g is not None:
+            args += ["--gguf", str(g)]
     if body.get("seed") not in (None, ""):
         args += ["--seed", str(body["seed"])]
+    # 同样把收到的规格参数记一行：视频这条链上「时长/分辨率没生效」的投诉，
+    # 一半是上游压根没传，另一半是被后端按 121 帧 / 显存上限收窄了。
+    log(
+        f"视频提交 model={model} size={_video_size(body)} "
+        f"resolution={body.get('resolution')!r} ratio={body.get('ratio')!r} "
+        f"duration={body.get('duration')!r} steps={body.get('steps')!r} "
+        f"backend={body.get('backend')!r}"
+    )
 
     unsupported = []
     tail = body.get("last_frame") or body.get("tail_image")
@@ -557,9 +1245,12 @@ def _submit_video_locked(body):
         tp = OUT / f"tail_{job_id}.png"
         _decode_data_url(tail).save(tp)
         args += ["--last-frame", str(tp)]
-        if not VIDEO_LAST_FRAME:
+        # Wan2.2-TI2V-5B 这条管线只吃首帧；H3 的 DiffSynth 路线才真支持首尾帧
+        if not small and not VIDEO_LAST_FRAME:
             # 收下这张图是为了「日志里能证明客户端确实发过来了」，
             # 但这条链路用不上它 —— 回执里说清楚，客户端会把它挂成一条可见提示。
+            unsupported.append("last_frame")
+        if small:
             unsupported.append("last_frame")
 
     imgs = body.get("image")
@@ -585,10 +1276,33 @@ def _submit_video_locked(body):
         log(f"视频任务 {job_id} 进程结束（exit={proc.returncode}）")
 
     threading.Thread(target=reap, daemon=True).start()
+
+    # 参数被后端硬性收窄时必须回话。
+    # Wan 这条链路上限 121 帧（24 fps ≈ 5.04 秒），而画布的时间轨是 1–30 秒连续可选 ——
+    # 用户拖到 10 秒、出片只有 5 秒，如果回执不说，现象就是「时长参数没生效」。
+    clamped = {}
+    if small:
+        want_dur = float(body.get("duration") or body.get("seconds") or 5)
+        max_dur = 121 / 24.0
+        if want_dur > max_dur + 0.01:
+            clamped["durationSec"] = {"want": want_dur, "max": round(max_dur, 2)}
+    size_want = str(body.get("size") or "")
+    if small and size_want:
+        try:
+            w, h = [int(float(x)) for x in size_want.lower().replace("*", "x").split("x")]
+            long_side = max(w, h)
+            # 12 GB 卡上长边超过 1216 就要顶穿显存预算（vram_guard 会直接 OOM）
+            if long_side > 1216:
+                clamped["resolution"] = {"want": size_want, "max": "1216"}
+        except Exception:
+            pass
+
     return {
         "id": job_id, "status": "queued", "model": model, "created": int(time.time()),
         # 客户端拿它决定「要不要在卡片上留一条提示」：请求里带了、后端用不上的部分
         "unsupported": unsupported,
+        # 请求里带了、但被后端按硬件上限收窄的部分
+        "clamped": clamped,
     }
 
 
@@ -734,8 +1448,139 @@ def _dir_bytes(p: str, limit: int = 0) -> int:
 
 
 def _video_ready(p: str) -> bool:
-    """能真的加载：入口文件在，**并且**权重大体齐了。"""
+    """能真的加载：入口文件在，**并且**权重大体齐了。
+
+    低显存小模型档例外：它是 GGUF 量化权重，本来就只有 3–4 GB，
+    按 H3 的 29.2 GB 体积门槛判会把「装好了」判成「没装」——
+    又是一次「拿别人的规格当自己的判据」。这一档只看组件齐不齐。
+    """
+    small = small_video_dir()
+    if small and os.path.abspath(str(p)) == os.path.abspath(small):
+        return True
     return _has_weights(p) and _dir_bytes(str(p), VIDEO_MIN_BYTES) >= VIDEO_MIN_BYTES
+
+
+# ============================================================== 低显存小模型档
+#
+# 消费卡（12 GB）跑不动 H3-NF4（34.4 GB 权重 / 需 30–36 GB 显存），
+# 也跑不动 Qwen-Image 的 bf16 全量（33 GB 权重 + 约 22 GB 峰值）。
+# 这一档不换模型家族，只换**加载精度**：
+#
+#   图片  Qwen-Image-2.1 + GGUF Q4 transformer（Q4_K_M 约 4.2 GB）
+#   视频  Wan2.2-TI2V-5B + GGUF Q4 transformer（Q4_K_M 约 3.4 GB，文生/图生同一个模型）
+#
+# 判据仍然是「能不能加载」：目录里要有 diffusers 的 `model_index.json`、
+# 各组件的 config，以及至少一个 `.gguf`。**只放一个 gguf 文件不算**。
+
+SMALL_ROOT = Path(os.environ.get("YJ_SMALL_ROOT") or (ROOT.parent / "models"))
+IMAGE_SMALL = Path(os.environ.get("YJ_IMAGE_SMALL_DIR") or (SMALL_ROOT / "Qwen-Image-2.1"))
+VIDEO_SMALL = Path(os.environ.get("YJ_VIDEO_SMALL_DIR") or (SMALL_ROOT / "Wan2.2-TI2V-5B"))
+
+# ---- 低显存图像档 B：SDXL-Lightning ----
+#
+# Qwen-Image-2.1 在「12 GB 显存 + 32 GB 内存」这类机器上**功能没坏，但产品上不能用**：
+# Qwen3-VL-8B 编码器 bf16 就 17.5 GB，加 DiT 4.2 GB，一加载常驻 22 GB 内存、
+# 冷启动 250 秒 —— 实测两次把用户的机器拖到鼠标都动不了。
+#
+# SDXL-Lightning 是 SDXL base 的 4 步蒸馏版，一个完整 checkpoint 6.6 GB：
+#   加载  20 秒级（vs 250 秒）
+#   常驻  内存 ~7 GB / 显存 ~6 GB（vs 22 GB / 21 GB）
+#   出图  1024² 四步 2-3 秒
+# 画质不如 2.1，但这是这类机器上唯一「打开就能用」的档。2.1 留给 64 GB 内存以上的机器。
+SDXL_DIR = Path(os.environ.get("YJ_SDXL_DIR") or (SMALL_ROOT / "SDXL-Lightning"))
+SDXL_STEPS = int(os.environ.get("YJ_SDXL_STEPS", "4"))
+# Lightning 从 SDXL base 蒸馏，原生 1024。往下压到 768 不会更快多少，
+# 反而偏离 base 的分桶训练分布（构图塌）。
+SDXL_MAX_SIDE = int(os.environ.get("YJ_SDXL_MAX_SIDE", "1024"))
+# fp16 完整 checkpoint 6.6 GB。门槛取 6.0 GB：半截文件（3.x GB）不能被判成 ready。
+SDXL_MIN_BYTES = int(6.0 * 1024 ** 3)
+
+# 别名 → SDXL 档。前端下拉里传的是给人看的名。
+SDXL_ALIASES = ("sdxl-lightning", "sdxl_lightning", "sdxl", "lightning", "sd-xl")
+
+# 中文提示词 → 英文的本地翻译（MarianMT，298 MB）。
+# SDXL 的双 CLIP 是纯英文语料训的，中文提示词会退化成噪声（实测：出抽象色块）。
+# 装上它，中文提示词在低显存档上才能正常工作。
+TRANS_DIR = Path(os.environ.get("YJ_TRANS_DIR") or (SMALL_ROOT / "opus-mt-zh-en"))
+
+
+def _sdxl_ckpt(d: Path) -> Path | None:
+    """挑完整的 SDXL checkpoint —— 跳过 LoRA 那种几百 MB 的小文件。"""
+    try:
+        cands = sorted(Path(d).glob("*.safetensors"))
+    except OSError:
+        return None
+    for c in cands:
+        try:
+            if c.stat().st_size >= SDXL_MIN_BYTES:
+                return c
+        except OSError:
+            continue
+    return None
+
+
+def sdxl_dir() -> str:
+    """SDXL-Lightning 可加载目录；不可用返回空串（真看文件，不看标记）。"""
+    d = SDXL_DIR
+    try:
+        ok = (d / "model_index.json").is_file() and _sdxl_ckpt(d) is not None
+    except OSError:
+        ok = False
+    return str(d) if ok else ""
+
+
+def _gguf_in(d: Path) -> Path | None:
+    """找一个能用的 GGUF 分片。
+
+    排序不是随便定的：**同目录里先找 Turbo（4 步蒸馏）**，再按量化档。
+    蒸馏权重只改采样步数不改架构，Q4_K_M 也能在 12 GB 卡上 4 步出片 ——
+    这是低显存档能把「一条 5 秒片」从半小时压到几分钟的关键那一项。
+    """
+    try:
+        cands = sorted(Path(d).glob("*.gguf"))
+    except OSError:
+        return None
+    if not cands:
+        return None
+    for prefer in ("turbo", "Turbo", "Lightning", "lightning"):
+        for c in cands:
+            if prefer in c.name and "Q4_K_M" in c.name:
+                return c
+    for prefer in ("Q4_K_M", "Q4_K_S", "Q5_K_M", "Q8_0"):
+        for c in cands:
+            if prefer in c.name:
+                return c
+    return cands[0]
+
+
+def small_video_dir() -> str:
+    d = VIDEO_SMALL
+    try:
+        ok = (
+            (d / "model_index.json").is_file()
+            and (d / "transformer" / "config.json").is_file()
+            and _gguf_in(d) is not None
+        )
+    except OSError:
+        ok = False
+    return str(d) if ok else ""
+
+
+def small_image_dir() -> str:
+    d = IMAGE_SMALL
+    try:
+        ok = (d / "model_index.json").is_file() and _gguf_in(d) is not None
+    except OSError:
+        ok = False
+    return str(d) if ok else ""
+
+
+def _is_small(p) -> bool:
+    """这个路径是不是小模型档的目录（用来分叉 worker / 参数默认值）。"""
+    if not p:
+        return False
+    ap = os.path.abspath(str(p))
+    return any(ap == os.path.abspath(x) for x in (small_video_dir(), small_image_dir()) if x)
 
 
 def _scan_video_dirs():
@@ -761,9 +1606,12 @@ def _scan_video_dirs():
 
 
 def video_model():
-    """当前该用的视频权重：env 有效就用 env，否则现扫一遍盘，扫不到再回仓库 id。"""
+    """当前该用的视频权重：env 有效就用 env，否则小显存档，再否则现扫一遍盘。"""
     if _video_ready(VIDEO_MODEL):
         return VIDEO_MODEL
+    small = small_video_dir()
+    if small:
+        return small
     now = time.time()
     if now - _VIDEO_SCAN["at"] > _VIDEO_SCAN_TTL:
         _VIDEO_SCAN["at"] = now
@@ -809,25 +1657,50 @@ class Handler(BaseHTTPRequestHandler):
                 # video: missing，明明 H3 权重齐着、也能出片。用「脚本文件存在性」
                 # 判能力本身就是脆的：文件在也不代表权重在。
                 # image 以前直接写死 "ready"，同理改成真看目录。
-                "image": "ready" if _has_weights(IMAGE_MODEL) else "missing",
+                # 低显存档的目录名不叫 `Qwen/Qwen-Image-2.1`（那是仓库名，
+                # 本地落在 models/Qwen-Image-2.1），只看仓库名会永远报 missing ——
+                # 明明盘上装着 23 GB 权重。所以两个来源都要判。
+                "image": "ready" if (_has_weights(IMAGE_MODEL) or small_image_dir() or sdxl_dir()) else "missing",
                 "video": "ready" if _video_ready(video_model()) else "missing",
             }
             return self._json(200, {
                 "ok": True, "mode": MODE, "caps": caps, "vram": LEASE.stats(),
                 "models": {
-                    "image": IMAGE_MODEL, "video": video_model(),
+                    # 报「真正会跑的那个」：装了 SDXL 就不再声称默认是 2.1。
+                    "image": "sdxl-lightning" if sdxl_dir() else IMAGE_MODEL,
+                    "image_steps": SDXL_STEPS if sdxl_dir() else IMAGE_STEPS,
+                    "image_max_side": SDXL_MAX_SIDE if sdxl_dir() else IMAGE_MAX_SIDE,
+                    "image_offload": IMAGE_OFFLOAD,
+                    "video": video_model(),
                     "video_default": video_model() or VIDEO_DEFAULT,
-                    "image_steps": IMAGE_STEPS,
-                    "image_max_side": IMAGE_MAX_SIDE, "image_offload": IMAGE_OFFLOAD,
                 },
             })
 
         if path == "/v1/models":
+            # 报**画布认的短名**，不报目录路径：路径是这台机器的实现细节，
+            # 而 `wan2.2-ti2v-5b` 这种短名才是画布下拉里的选项。
+            # 客户端据此决定「这台机器上到底有哪些模型可选」——
+            # 列一堆装不上的名字，用户选中后必然失败（以前就是这样）。
+            smallv = _is_small(video_model())
+            img_models = []
+            # 低显存档排在前面 = 默认选中它。它装了就一定比 2.1 更适合这台机器：
+            # 2.1 要 22 GB 内存，装得下不代表跑得动。
+            if sdxl_dir():
+                img_models.append(
+                    {"id": "sdxl-lightning", "object": "model",
+                     "owned_by": "local", "kind": "image"}
+                )
+            if small_image_dir() or _has_weights(IMAGE_MODEL):
+                img_models.append(
+                    {"id": "qwen-image-2.1" if small_image_dir() else IMAGE_MODEL,
+                     "object": "model", "owned_by": "local", "kind": "image"}
+                )
             return self._json(200, {
                 "object": "list",
                 "data": [
-                    {"id": IMAGE_MODEL, "object": "model", "owned_by": "local", "kind": "image"},
-                    {"id": video_model(), "object": "model", "owned_by": "local", "kind": "video"},
+                    *img_models,
+                    {"id": "wan2.2-ti2v-5b" if smallv else "minimax-h3",
+                     "object": "model", "owned_by": "local", "kind": "video"},
                     {"id": os.environ.get("YJ_TEXT_MODEL", "Qwen3-8B-Instruct"),
                      "object": "model", "owned_by": "local", "kind": "chat"},
                 ],
@@ -935,6 +1808,28 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/v1/audio/speech":
                 return proxy_voice(self, body)
 
+            if path in ("/v1/unload", "/unload"):
+                # 手动把权重还给系统。三档由 body 决定：
+                #   {"target":"image"}  只退图片（显存 + 内存）
+                #   {"target":"gpu"}    图片权重退出显存、内存保留（下次几秒可用）
+                #   {"target":"all"}    图片 + 语音一起退
+                target = str(body.get("target") or "image").lower()
+                did = []
+                if target in ("image", "all"):
+                    if LEASE.unload_image(why="手动 /v1/unload"):
+                        did.append("image")
+                if target in ("gpu",):
+                    if LEASE.offload_image(why="手动 /v1/unload"):
+                        did.append("image:gpu")
+                if target == "all":
+                    if LEASE._voice_unload():
+                        did.append("voice")
+                return self._json(200, {
+                    "unloaded": ",".join(did) or None,
+                    "image": LEASE.image_state(),
+                    "vram": LEASE.stats(),
+                })
+
             return self._json(404, {"error": {"message": f"未知路径 {path}"}})
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "ignore")[:400]
@@ -947,11 +1842,44 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    # 先画显存与线程两条硬线，再让任何 torch 张量落地。
+    # 不设的话 1024² 出图峰值 21 GB / 卡上 12 GB，Windows 会回落到系统内存，
+    # 把整机拖到鼠标都不动 —— 这是必须挡住的事故形态。
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from vram_guard import setup as _vram_setup  # noqa: PLC0415
+
+        _VRAM = _vram_setup(log, "model-server")
+    except Exception as _e:  # noqa: BLE001
+        _VRAM = {}
+        log(f"显存保护未启用：{_e!r}")
     log(f"model-server 起在 http://0.0.0.0:{PORT}（mode={MODE}）")
     log(f"产物目录 {OUT}")
     log(f"文本 {TEXT_UPSTREAM} / 语音 {VOICE_BASE}")
-    log(f"图片 {IMAGE_MODEL}（{IMAGE_STEPS} 步 / 长边 {IMAGE_MAX_SIDE}px / offload={IMAGE_OFFLOAD}）")
-    log(f"视频 {video_model() or '未安装（权重装了会自动生效，不用重启）'}（backend={VIDEO_BACKEND}，只有 H3 一个后端）")
+    # 报**实际生效**的档位，不是全量档的常量：低显存档走 768 / 8 步 / GGUF，
+    # 照常量印 1536 / 28 步会让人以为配错了（面板与日志口径必须与真跑的一致）。
+    if sdxl_dir():
+        _ck = _sdxl_ckpt(SDXL_DIR)
+        log(
+            f"图片 SDXL-Lightning（低显存档 {SDXL_STEPS} 步 / 长边 {SDXL_MAX_SIDE}px / "
+            f"{_ck.name if _ck else '?'} / offload={IMAGE_OFFLOAD}）"
+        )
+        if small_image_dir() or _has_weights(IMAGE_MODEL):
+            log(
+                f"     Qwen-Image 2.1 也可用（{IMAGE_STEPS} 步 / 长边 {IMAGE_MAX_SIDE}px），"
+                "但它常驻 ~22 GB 内存，只有显式选它才走"
+            )
+    else:
+        _small = _is_small(IMAGE_MODEL) or bool(small_image_dir())
+        _side = IMAGE_SMALL_SIDE if _small else IMAGE_MAX_SIDE
+        log(
+            f"图片 {IMAGE_MODEL}"
+            f"（{'低显存档 ' if _small else ''}{'8' if _small else IMAGE_STEPS} 步 / "
+            f"长边 {_side}px / offload={IMAGE_OFFLOAD}）"
+        )
+    log(f"视频 {video_model() or '未安装（权重装了会自动生效，不用重启）'}（backend={VIDEO_BACKEND}）")
+    LEASE.start_idle_watcher()
+    _warm_translator()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try:
         srv.serve_forever()

@@ -1,15 +1,45 @@
 {
   "name": "yijing-studio",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
-  "description": "艺镜 Studio —— 混淆构建产物（不含源码），仅允许非商业使用",
+  "description": "艺镜 Studio - 画布优先的 AI 影像创作工作台",
+  "author": {
+    "name": "艺镜"
+  },
   "main": "dist-electron/electron/main.js",
-  "license": "SEE LICENSE IN ../LICENSE",
-  "author": "艺镜 Studio",
   "scripts": {
-    "start": "electron ."
+    "dev": "concurrently -k \"vite\" \"npm:dev:electron\"",
+    "dev:electron": "tsc -b tsconfig.main.json && cross-env NODE_ENV=development electron .",
+    "dev:web": "vite",
+    "build": "npm run build:main && npm run build:renderer",
+    "build:main": "tsc -b tsconfig.main.json",
+    "build:renderer": "vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "electron .",
+    "build:web": "vite build --config vite.web.config.ts",
+    "web": "node web/host.mjs",
+    "build:obf": "node scripts/obfuscate.mjs renderer && node scripts/obfuscate.mjs main",
+    "dist:win": "npm run build && npm run build:obf && electron-builder --win nsis --x64",
+    "pack:cloud": "node scripts/pack-cloud.mjs"
+  },
+  "dependencies": {
+    "@xyflow/react": "^12.11.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "zustand": "^4.4.0"
   },
   "devDependencies": {
-    "electron": "^44.0.0"
+    "@types/node": "^20.10.0",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "@vitejs/plugin-react": "^4.2.0",
+    "concurrently": "^8.2.2",
+    "cross-env": "^7.0.3",
+    "electron": "^44.0.0",
+    "electron-builder": "^25.1.8",
+    "javascript-obfuscator": "^4.2.2",
+    "playwright-core": "^1.64.1",
+    "typescript": "^5.3.0",
+    "vite": "^5.0.0"
   }
 }
