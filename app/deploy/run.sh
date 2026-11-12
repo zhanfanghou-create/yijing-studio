@@ -85,6 +85,26 @@ export YJ_IMAGE_MODEL="${YJ_IMAGE_MODEL:-$(pick_model Qwen-Image-2.1)}"
 pick_video() {
   local base
   for base in "${YJ_LOCAL_MODELS:-/root/models}" /root/cloud/models; do
+    # 0：HyperFlow H3 Flash（云端大显存档的默认）
+    #
+    # 它和别的档不一样 —— **主干和组件分两处**：
+    #   $base/hyperflow-h3-flash/fl2va_int8_convrot/   INT8 主干 16 GB
+    #   组件（编码器 63 GB + VAE）→ 包内 MiniMax-H3/ 或同级 MiniMax-H3/，两处都认
+    # 所以「有主干」不等于「能跑」，两处都得在。model-server 那边 `flash_ready()`
+    # 用的是同一套判据（含同样的两个候选位置），两边不能各判各的。
+    _fbase=""
+    if [ -f "$base/hyperflow-h3-flash/MiniMax-H3/modular_model_index.json" ]; then
+      _fbase="$base/hyperflow-h3-flash/MiniMax-H3"
+    elif [ -f "$base/MiniMax-H3/modular_model_index.json" ]; then
+      _fbase="$base/MiniMax-H3"
+    fi
+    if [ -n "$_fbase" ] \
+       && [ -f "$base/hyperflow-h3-flash/fl2va_int8_convrot/config.json" ] \
+       && [ -d "$_fbase/text_encoder" ] \
+       && [ -d "$_fbase/vae" ] \
+       && [ -d "$_fbase/audio_vae" ]; then
+      echo "$base/hyperflow-h3-flash"; return
+    fi
     # A：官方分区
     if [ -f "$base/MiniMax-H3/FL2VA/model_index.json" ]; then
       echo "$base/MiniMax-H3/FL2VA"; return
@@ -126,16 +146,19 @@ _vram_gb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/
   | sort -rn | head -1 | awk '{ printf "%d", ($1 + 512) / 1024 }')
 _vram_gb="${_vram_gb:-0}"
 case "${YJ_VIDEO_MODEL:-}" in
+  # HyperFlow H3 Flash：官方在 24 GB / 32 GB 卡上实测过，48 GB 上 offload 走 model/stream 更宽。
+  # 16 GB 卡上游明说「未测」，所以门槛按 24 报，别让人以为 16 GB 也能跑。
+  *hyperflow*|*HyperFlow*|*flash*) _vram_need=24 ;;
   *nf4*|*NF4*) _vram_need=8 ;;
   *)           _vram_need=125 ;;
 esac
 if [ -z "${YJ_VIDEO_MODEL:-}" ] || [ ! -d "$YJ_VIDEO_MODEL" ]; then
-  # 30 G 镜像里放不下 34 G 的 NF4 权重，所以「盘上没有」是常见状态，不是故障。
+  # 30 G 镜像里放不下几十 G 的权重，所以「盘上没有」是常见状态，不是故障。
   # 说清「没装」比甩一串显存门槛有用。两条补装路径都写上：
   # 网页面板那条是现在的主路径（宿主自己下、能续传），bootstrap 那条留给纯命令行。
   echo "  · 视频：未安装权重（${YJ_VIDEO_MODEL:-未配置}）"
-  echo "    装：网页「模型配置」里点视频模型下载（落盘 ${YJ_INSTALL_ROOT}/MiniMax-H3-NF4，约 34 GB）"
-  echo "        或 bash deploy/bootstrap.sh models video"
+  echo "    装：bash deploy/bootstrap.sh models video（HyperFlow H3 Flash：主干 17 GB + 组件 63 GB）"
+  echo "        或网页「模型配置」里点视频模型下载（落盘 ${YJ_INSTALL_ROOT}）"
 elif [ "$_vram_gb" -gt 0 ] && [ "$_vram_gb" -lt "$_vram_need" ]; then
   echo "  ! 视频：当前权重（${YJ_VIDEO_MODEL}）需要 ${_vram_need} G 以上显存，"
   echo "    这台只有 ${_vram_gb} G —— 生视频会显存不足。换 NF4 量化版可降到 8 G 起。"

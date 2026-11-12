@@ -10,11 +10,15 @@
 """
 from __future__ import annotations
 
+import faulthandler
 import json
 import os
+import queue
+import signal
 import sys
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MODEL_DIR = os.environ.get("YJ_TEXT_MODEL", "/root/cloud/models/Qwen3-8B")
@@ -22,6 +26,36 @@ MODEL_NAME = os.environ.get("YJ_TEXT_NAME", "qwen3-8b")
 PORT = int(os.environ.get("YJ_TEXT_PORT", "8001"))
 # 默认上限压住，避免画布一次性塞几万字把显存顶爆
 MAX_NEW = int(os.environ.get("YJ_TEXT_MAX_NEW", "2048"))
+# 流式总时长上限。单卡上视频任务在跑时文本会被挤慢，给太短会误杀；但不设上限
+# 一旦生成线程卡死，连接就会永久挂着（客户端既不超时也不报错，最难查）
+STREAM_TIMEOUT = float(os.environ.get("YJ_TEXT_STREAM_TIMEOUT", "900"))
+# 两个分片之间最多能安静多久。正常生成是几十毫秒一片；45 秒还没有动静就是真的停了
+STREAM_IDLE = float(os.environ.get("YJ_TEXT_STREAM_IDLE", "45"))
+
+
+def _iter_stream(streamer):
+    """
+    按分片迭代，但**不给无限等待的机会**。
+
+    为什么不用 `for piece in streamer`：生成线程停住时（或某个 token 之后再也不 put），
+    那个写法会永久阻塞 —— 客户端看到的就是「回复说到一半、光标一直闪」：
+    既不报错也不超时，用户只能刷新。改成带超时的取队列后，`STREAM_IDLE` 秒没有
+    新分片就当作生成已结束，把已经吐出来的内容正常收尾，并在日志里留一行记录。
+    """
+    q = getattr(streamer, "text_queue", None)
+    if q is None:  # 老版本没有这个属性：退回原写法，行为不变
+        for piece in streamer:
+            yield piece
+        return
+    while True:
+        try:
+            piece = q.get(timeout=STREAM_IDLE)
+        except queue.Empty:
+            log(f"流式停顿 {STREAM_IDLE:.0f}s 没有新分片，主动收尾（生成线程可能已停）")
+            return
+        if piece is None:
+            return
+        yield piece
 
 _lock = threading.Lock()
 _state: dict = {"model": None, "tok": None, "loading": False, "error": None}
@@ -164,8 +198,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        # 这里**必须**让应答体有明确的结束标记。
+        #
+        # 流式 SSE 既没有 Content-Length 也不用 chunked（每个分片直接 write+flush），
+        # HTTP/1.1 下客户端只能靠「连接被关闭」判断结束。而 BaseHTTPRequestHandler 在
+        # HTTP/1.1 请求里默认 keep-alive，do_POST 返回后连接不关 —— 客户端于是
+        # 收得到文字、收得到 [DONE]，然后永远等下一个字节。
+        # 前端表现就是「对话说一半卡住一直转圈」，服务端日志一片干净，最难查。
+        self.send_header("Connection", "close")
         self.end_headers()
+        self.close_connection = True
 
         def chunk(delta: dict, finish=None) -> None:
             payload = {
@@ -180,13 +222,43 @@ class Handler(BaseHTTPRequestHandler):
             **ids, max_new_tokens=max_new, do_sample=True, temperature=0.7, top_p=0.8,
             repetition_penalty=1.05, pad_token_id=tok.eos_token_id, streamer=streamer,
         )
-        th = threading.Thread(target=lambda: model.generate(**kw), daemon=True)
+
+        def _run() -> None:
+            """
+            生成线程**必须自己兜异常**。
+
+            `TextIteratorStreamer` 只有在 generate 正常结束时才 put 一个 None 收尾。
+            生成线程抛异常（显存不够、dtype 不匹配、max_new 算错……）时那个 None
+            永远不会来，主线程的 `for piece in streamer` 就永久阻塞 ——
+            客户端看到的正是最难排查的那种现象：**连接建立成功、响应头 200、一个字都不来**，
+            既不超时也不报错。这里补上 finally：异常照原样打到日志，并主动 end() 收尾。
+            """
+            try:
+                with torch.inference_mode():
+                    model.generate(**kw)
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+                try:
+                    streamer.end()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        th = threading.Thread(target=_run, daemon=True)
         th.start()
         chunk({"role": "assistant", "content": ""})
+
+        # 总时长兜底：单卡上视频任务在跑时，文本能被挤到几十秒才出一个字，
+        # 所以这里不给「空闲」超时（会误杀正常但很慢的生成），只给一个说得过去的上限。
+        # 到点调 `streamer.end()`（公开 API，等价于 put None），主循环就能正常收尾。
+        watchdog = threading.Timer(STREAM_TIMEOUT, streamer.end)
+        watchdog.daemon = True
+        watchdog.start()
+        sent = 0
         try:
-            for piece in streamer:
+            for piece in _iter_stream(streamer):
                 if piece:
                     chunk({"content": piece})
+                    sent += 1
             th.join(timeout=1)
             chunk({}, finish="stop")
             self.wfile.write(b"data: [DONE]\n\n")
@@ -198,10 +270,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(f"data: {json.dumps({'error': str(e)})}\n\n".encode())
             except Exception:  # noqa: BLE001
                 pass
+        finally:
+            watchdog.cancel()
 
 
 def main() -> int:
     log(f"文本服务 {MODEL_NAME} @ {PORT}，权重 {MODEL_DIR}")
+    # 生成线程卡住时要能看栈。容器里没有 CAP_SYS_PTRACE（py-spy 用不了），
+    # 但进程自己 dump 不需要权限：kill -USR1 <pid> 就把所有线程栈写进 chat.log
+    try:
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+    except Exception:  # noqa: BLE001
+        pass
     if os.environ.get("YJ_TEXT_PRELOAD") == "1":
         try:
             ensure_model()

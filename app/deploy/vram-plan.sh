@@ -24,8 +24,8 @@ read -r -d '' PLAN <<'JSON' || true
    "note":"bf16 权重 16 G；24 G 卡要限制上下文长度才留得下 KV cache"},
   {"key":"image","label":"Qwen-Image-2.1 生图","disk":31,"vram":24,
    "note":"transformer 约 20 G + 文本编码器；24 G 卡必须开 offload，出图慢一档"},
-  {"key":"video","label":"MiniMax-H3 视频（唯一后端）","disk":34,"vram":12,
-   "note":"NF4 只收 FL2VA 四件 = 34.4 G 权重（官方 README：最低 8 G 显存，靠 disk offload；24 G 以上才有实用速度）。官方 bf16 全量 171 G / 125 G 显存，别下那份"},
+  {"key":"video","label":"HyperFlow H3 Flash 视频","disk":91,"vram":24,
+   "note":"主干 INT8 16 G（fl2va）+ 组件 74 G（文本编码器 63 / 视频 VAE 10 / 音频 VAE 0.6）。官方在 24 G 与 32 G 卡上实测过，16 G 未测；bf16 编码器 offload 要 ≥91 GiB 内存"},
   {"key":"voice","label":"Qwen3-TTS-1.7B 三件套","disk":13,"vram":6,
    "note":"同一时刻只驻留一个，6 G 足够；三件套 12 G 磁盘"}
 ]
@@ -53,11 +53,9 @@ GPU_NAME="${YJ_GPU_NAME:-${GPU_NAME:-无 GPU}}"
 
 # 档位只决定「哪些进必装清单」，不改变单个模型的判断：
 # 真正能不能跑由 vram 字段比大小决定，档位只是给个人话说明。
-if   [ "$VRAM_GB" -ge 128 ]; then TIER="full";        TIER_DESC="大显存单卡 · H3 可跑 bf16"
-elif [ "$VRAM_GB" -ge 96  ]; then TIER="xl";          TIER_DESC="96 G 级 · H3 可跑"
-elif [ "$VRAM_GB" -ge 48  ]; then TIER="large";       TIER_DESC="48 G 级 · H3 上 NF4 版"
-elif [ "$VRAM_GB" -ge 24  ]; then TIER="standard";    TIER_DESC="24 G 级 · 生图要 offload，视频走 NF4"
-elif [ "$VRAM_GB" -ge 16  ]; then TIER="compact";     TIER_DESC="16 G 级 · 生图吃力，视频靠 disk offload"
+if   [ "$VRAM_GB" -ge 48  ]; then TIER="large";       TIER_DESC="48 G 级 · 视频走 HyperFlow（offload 更宽松）"
+elif [ "$VRAM_GB" -ge 24  ]; then TIER="standard";    TIER_DESC="24 G 级 · 生图要 offload，视频 HyperFlow 6 步"
+elif [ "$VRAM_GB" -ge 16  ]; then TIER="compact";     TIER_DESC="16 G 级 · 生图吃力，视频建议换 Wan2.2 低显存档"
 else                              TIER="minimal";     TIER_DESC="显存不足 16 G · 只跑对话与语音"
 fi
 

@@ -94,13 +94,36 @@ ensure_node() {
 }
 
 ensure_ffmpeg() {
-  if need_cmd ffmpeg; then ok "ffmpeg $(ffmpeg -version 2>/dev/null | head -1 | awk '{print $3}')"; return; fi
-  say "安装 ffmpeg（抽首帧 / 拼音频 / 导出都要它）..."
+  if need_cmd ffmpeg; then ok "ffmpeg $(ffmpeg -version 2>/dev/null | head -1 | awk '{print $3}')"; else
+    say "安装 ffmpeg（抽首帧 / 拼音频 / 导出都要它）..."
+    if need_cmd apt-get; then
+      (apt-get update -qq && apt-get install -y -qq ffmpeg) >/dev/null 2>&1 || die "ffmpeg 装失败"
+      ok "ffmpeg 已装"
+    else
+      die "没有 apt，请手动装 ffmpeg 后重试"
+    fi
+  fi
+}
+
+# Triton 的 kernel 是**运行时用 gcc 编译**的（`cuda_utils` 那个 .so），
+# 而它的 driver.c 里 `#include <Python.h>` —— 缺 python3-dev 就编译不过。
+# 现象特别误导人：模型加载一切正常，第一次采样才炸在
+#   `CalledProcessError: Command '['/usr/bin/gcc', ...]' returned non-zero`
+# 看起来像「CUDA 坏了」或「模型装错了」，其实是少一个 6 MB 的头文件包。
+# 精简过的镜像（仙宫云的 pytorch 镜像就是）默认没有它。
+ensure_py_headers() {
+  if python3 -c "import sysconfig,os;sys.exit(0 if os.path.exists(os.path.join(sysconfig.get_paths()['include'],'Python.h')) else 1)" 2>/dev/null; then
+    ok "Python 头文件已就位（triton kernel 可编译）"
+    return
+  fi
+  say "安装 python3-dev（HyperFlow 的 INT8 kernel 要用它编译）..."
   if need_cmd apt-get; then
-    (apt-get update -qq && apt-get install -y -qq ffmpeg) >/dev/null 2>&1 || die "ffmpeg 装失败"
-    ok "ffmpeg 已装"
+    (apt-get install -y -qq --no-install-recommends python3.10-dev python3-dev) >/dev/null 2>&1 \
+      || (apt-get update -qq && apt-get install -y -qq --no-install-recommends python3-dev) >/dev/null 2>&1 \
+      || { warn "python3-dev 装失败：HyperFlow 视频会卡在第一次采样（NameError/triton 编译错误）"; return; }
+    ok "python3-dev 已装"
   else
-    die "没有 apt，请手动装 ffmpeg 后重试"
+    warn "没有 apt，HyperFlow 的 triton kernel 可能编不出来（缺 Python.h）"
   fi
 }
 
@@ -159,14 +182,15 @@ cmd_install() {
     warn "没有探到 GPU（无卡模式？）—— 界面能开，生成能力会是 down"
   else
     ok "GPU $gname / ${gmem} MiB / 驱动 $gdrv"
-    if [ "${gmem:-0}" -lt 40000 ] 2>/dev/null; then
-      warn "显存 ${gmem} MiB 偏小：Qwen-Image-2.1 开 offload 能跑，但 MiniMax H3 要 40 GB 以上，"
-      warn "  视频会 OOM。先用 YJ_MODE=image 把图片链路跑通，或换 48G 卡。"
+    if [ "${gmem:-0}" -lt 24000 ] 2>/dev/null; then
+      warn "显存 ${gmem} MiB：Qwen-Image-2.1 开 offload 能跑，但 HyperFlow H3 Flash 要 24 GB 以上，"
+      warn "  视频会退回 Wan2.2 低显存档（或 OOM）。先用 YJ_MODE=image 把图片链路跑通，或换 24G/48G 卡。"
     fi
   fi
 
   ensure_node
   ensure_ffmpeg
+  ensure_py_headers
   ensure_python
 
   local data; data="$(detect_data_dir)"
@@ -203,14 +227,18 @@ YJ_IMAGE_MAX_SIDE=1536
 # 必须为 1：把文本编码器用完挪回内存，峰值 40G→22G
 YJ_IMAGE_OFFLOAD=1
 
-# ---- 视频：MiniMax H3-Base（768p / 24fps / 原生立体声，音画一起出）
-# 产品上只支持这一个视频后端，不再有第二档快模型
-YJ_VIDEO_MODEL=MiniMaxAI/MiniMax-H3
+# ---- 视频：HyperFlow H3 Flash（MiniMax-H3 的 13.7B 少步压缩版）
+# 6 步无 CFG / 768p 短边 / 24fps / 一条里连 32 kHz 立体声一起出
+# 权重分两处：主干 hyperflow-h3-flash/fl2va_int8_convrot（16 GB）
+#            组件 hyperflow-h3-flash/MiniMax-H3（编码器 63 GB + VAE）
+YJ_VIDEO_MODEL=/root/models/hyperflow-h3-flash
+YJ_FLASH_DIR=/root/models/hyperflow-h3-flash
+YJ_FLASH_BASE=/root/models/hyperflow-h3-flash/MiniMax-H3
 # auto | diffusers | diffsynth | sglang | cmd
 YJ_VIDEO_BACKEND=auto
-# 48G 卡也建议开：H3 主干 + 32B 文本编码器全量放不下
-YJ_VIDEO_OFFLOAD=1
-# 单条 H3 可能 8-15 分钟，旧的 25 分钟上限已不够用
+# 采样步数：4（快）/ 6（默认，均衡）/ 8（画质），上游只在这三档训过
+YJ_FLASH_STEPS=6
+# 单条 6 步 / 5 秒片：加载约 90 s + 采样约 2–4 分钟（stream offload）
 YJ_VIDEO_TIMEOUT_MIN=120
 
 # 语音引擎（vendor/voice，端口 3910）：Qwen3-TTS-1.7B 三件套
@@ -283,11 +311,32 @@ EOF
       torchaudio sherpa-onnx fastapi uvicorn python-multipart 2>/dev/null || \
       warn "语音运行时依赖没装全（合成或转录可能失败）"
 
-    # DiffSynth：H3 的 NF4 路线（ModelScope 官方推荐），装不上就退回 diffusers/SGLang
+    # HyperFlow H3 Flash：视频**默认档**的推理包。
+    #
+    # 一律 `--no-deps`：它的依赖（diffusers>=0.40 / transformers>=4.57 / torch>=2.6 /
+    # torchvision / av / safetensors）上面都装过且版本更高，让 pip 去解那棵树
+    # 只会把 transformers 降回 4.x —— 然后图片和视频一起报 import 错。
+    # 这个坑 qwen-tts 已经踩过一次（见上面那段），不要再踩第二次。
+    if "$ROOT/.venv/bin/python" -c 'import hyperflow_h3_flash' 2>/dev/null; then
+      ok "HyperFlow H3 Flash 推理包已装"
+    else
+      say "安装 HyperFlow H3 Flash 推理包（Apache-2.0，约 200 KB）..."
+      if [ -d "$ROOT/vendor/hyperflow-h3-flash" ]; then
+        "$ROOT/.venv/bin/pip" install -q --no-deps -e "$ROOT/vendor/hyperflow-h3-flash" \
+          && ok "已装（本地 vendor）"
+      else
+        "$ROOT/.venv/bin/pip" install -q --no-deps \
+          "git+https://github.com/Video-Rebirth/hyperflow-h3-flash" \
+          && ok "已装（GitHub）" \
+          || warn "HyperFlow 包没装上：视频会退回 H3-NF4 / Wan2.2"
+      fi
+    fi
+
+    # DiffSynth：老 H3-NF4 路线（已装过的机器保留；新机器默认走 HyperFlow）
     if [ -d "$ROOT/vendor/DiffSynth-Studio" ]; then
       "$ROOT/.venv/bin/pip" install -q -e "$ROOT/vendor/DiffSynth-Studio[quant]" 2>/dev/null && ok "DiffSynth 已装"
     else
-      dim "  想要 H3 的 NF4 路由：git clone https://github.com/modelscope/DiffSynth-Studio vendor/DiffSynth-Studio"
+      dim "  （可选）老 H3-NF4 路由要 DiffSynth：git clone https://github.com/modelscope/DiffSynth-Studio vendor/DiffSynth-Studio"
     fi
   else
     warn "跳过模型依赖（加 --with-models 才装）。只装界面：生成会报「没装 torch / diffusers」"
@@ -315,9 +364,8 @@ cmd_models() {
   load_env
   local want="${1:-auto}"
   # auto = 按这台机器**实际显存**决定下哪些（deploy/vram-plan.sh）。
-  # 视频分两档：H3 全量（NF4 量化只收 FL2VA 四件 = 34.4 GB，官方口径最低 8 G 显存）
-  # 与 Wan2.2-TI2V-5B 低显存档（GGUF Q4 + 蒸馏 4 步，12 G 卡可跑）。
-  # bf16 全量要 125 G 显存，`all` 里绝不该带上它。
+  # 视频三档：HyperFlow H3 Flash（默认，24 G 起）、Wan2.2-TI2V-5B 低显存档（12 G 起）
+  # 与老 H3-NF4（已装过的机器保留识别能力，新机器不再默认下）。
   if [ "$want" = "auto" ]; then
     if [ -x "$ROOT/deploy/vram-plan.sh" ] || [ -f "$ROOT/deploy/vram-plan.sh" ]; then
       want="$(bash "$ROOT/deploy/vram-plan.sh" --want 2>/dev/null | tr -d '\r')"
@@ -328,21 +376,21 @@ cmd_models() {
   local py="$ROOT/.venv/bin/python"
   [ -x "$py" ] || die "还没有 .venv，先跑：bash deploy/bootstrap.sh install --with-models"
 
-  # 国内直连 huggingface.co 基本下不动；镜像 + hf_transfer 是两个数量级的差别
+  # 下载源：**魔搭优先**（境内 26 MB/s，HF 直连只有 0.55）。HF 镜像仍留着兜底，
+  # 魔搭没收录的仓库（例如 SenseVoice 的 sherpa 发布包）走它。
   export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
   export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
   local dir="$YJ_DATA/models"
   mkdir -p "$dir"
 
   say ""
-  say "════ 下载模型到 $dir（HF 镜像 $HF_ENDPOINT）════"
-  say "  图片  Qwen-Image-2.1                ~33 GB"
-  say "  视频  MiniMax-H3 NF4（默认）        ~34 GB（FL2VA 四件；8 G 显存起；唯一视频后端）"
-  say "        官方 bf16 全量要显式点名：models video-full   ~171 GB / 125 GB 显存"
-  say "  文本  Qwen3-8B-Instruct            ~16 GB"
+  say "════ 下载模型到 $dir（魔搭优先，HF 兜底 $HF_ENDPOINT）════"
+  say "  图片  Qwen-Image-2.1               ~33 GB"
+  say "  视频  HyperFlow H3 Flash           ~90 GB（主干 16 GB + 组件 74 GB；24 G 显存起）"
+  say "  文本  Qwen3-8B                     ~16 GB"
   say "  语音  Qwen3-TTS-1.7B × 3           ~13 GB"
   say "  ─────────────────────────────────────────────"
-  say "  该装哪些由显存决定（deploy/vram-plan.sh）；视频默认 H3 的 NF4 档，小显存可换 Wan2.2。"
+  say "  该装哪些由显存决定（deploy/vram-plan.sh）；小显存档换 Wan2.2（另见 PACKS_SMALL）。"
 
   YJ_WANT="$want" YJ_MODEL_DIR="$dir" YJ_VOICE_DIR="$ROOT/vendor/voice/data/models" \
   "$py" - <<'PY'
@@ -355,86 +403,99 @@ want = os.environ.get("YJ_WANT", "all")
 _wants = None if want.strip() == "all" else set(want.replace(",", " ").split())
 
 def take(key):
-    # `video-full`（官方 bf16 全量 171 GB）**只能点名装**：
-    # 它要 125 GB 显存，`all` 里带上它等于让每台机器白下 171 GB。
-    if key == "video-full":
-        return _wants is not None and key in _wants
     return _wants is None or key in _wants
 root = os.environ["YJ_MODEL_DIR"]
 vodir = os.environ["YJ_VOICE_DIR"]
 
-# (仓库, 目标子目录, 说明, 只下这些路径)。最后一列为 None 表示整仓都下。
+# (key, 仓库(HF), 仓库(魔搭), 目标子目录, 说明, 只下这些路径)。最后一列 None = 整仓。
 #
-# 视频默认下 **DiffSynth 的 NF4 量化版**，不是官方 bf16 全量（171 GB / 125 GB 显存）。
-# NF4 仓库里其实躺着 5 个大分片（fl2va / ref2va / 各自的 pruned 版），
-# 我们只要 FL2VA 这一路的 4 个 —— 全收是 72.5 GB，收白名单是 34.4 GB。
-H3_NF4_FILES = [
+# 视频默认下 **HyperFlow H3 Flash**：MiniMax-H3 的压缩少步版（13.7B），
+# 主干 INT8 16 GB、6 步无 CFG，一次前向连 32 kHz 立体声一起出。
+# 它和以前那两档最不一样的地方是**权重分两处**：
+#   ① 主干 fl2va_int8_convrot/ —— 三片 16 GB
+#   ② 组件 text_encoder(63 GB) / vae(10 GB) / audio_vae(0.6 GB) / tokenizer / processor
+#      —— 仍在 MiniMax-H3 原仓里，落到包内 `MiniMax-H3/`（model-server 认这个位置）
+# 所以这里是**两条 PLAN**，不是一条。少下任何一条，`flash_ready()` 都判不齐。
+#
+# 以前那条 H3-NF4（DiffSynth 34.4 GB）不再作为默认：它是原版 31B 主干，
+# 48 GB 卡上一条 5 秒片十分钟起步，而且没有音轨。
+FLASH_MAIN = ["fl2va_int8_convrot/*"]
+FLASH_PARTS = [
+    "modular_model_index.json",
+    "model_index.json",
     "configuration.json",
-    "minimax-h3-fl2va-nf4.safetensors",
-    "minimax-h3-text-encoder-nf4.safetensors",
-    "video_vae_nf4.safetensors",
-    "audio_vae_nf4.safetensors",
+    "text_encoder/*",
+    "vae/*",
+    "audio_vae/*",
+    "processor/*",
+    "tokenizer/*",
+    "scheduler/*",
+    "audio_scheduler/*",
 ]
 PLAN = [
-    ("image",      "Qwen/Qwen-Image-2.1",              None,               "图片 · Qwen-Image-2.1", None),
-    ("video",      "DiffSynth-Studio/MiniMax-H3-NF4",  "MiniMax-H3-NF4",   "视频 · MiniMax H3 NF4（唯一视频后端）", H3_NF4_FILES),
-    # 分词器不在 NF4 仓里，只有 11 MB，但少了它 pipeline 拿不到 prompt 的 token
-    ("video",      "MiniMaxAI/MiniMax-H3",             "MiniMax-H3-NF4",   "视频 · H3 分词器（11 MB）", ["FL2VA/processor/*"]),
-    ("video-full", "MiniMaxAI/MiniMax-H3",             None,               "视频 · MiniMax H3 官方 bf16 全量（要 125 GB 显存）", None),
-    ("text",       "Qwen/Qwen3-8B-Instruct",           None,               "文本 · Qwen3-8B", None),
+    ("image", "Qwen/Qwen-Image-2.1", "Qwen/Qwen-Image-2.1", None,
+     "图片 · Qwen-Image-2.1", None),
+    ("video", "VideoRebirthAI/hyperflow-h3-flash", "VideoRebirthAI/hyperflow-h3-flash",
+     "hyperflow-h3-flash", "视频 · HyperFlow H3 Flash 主干（INT8，16 GB）", FLASH_MAIN),
+    ("video", "MiniMaxAI/MiniMax-H3", "minimax/MiniMax-H3",
+     "hyperflow-h3-flash/MiniMax-H3", "视频 · 组件（文本编码器 63 GB + VAE）", FLASH_PARTS),
+    ("text", "Qwen/Qwen3-8B", "Qwen/Qwen3-8B", None, "文本 · Qwen3-8B", None),
 ]
 
 VOICE = [
-    ("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "qwen-tts-custom", "语音 · 预设音色 + 风格指令"),
-    ("Qwen/Qwen3-TTS-12Hz-1.7B-Base",        "qwen-tts-base",   "语音 · 3 秒克隆"),
-    ("Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign", "qwen-tts-design", "语音 · 文字造音色"),
-    ("Qwen/Qwen3-TTS-Tokenizer-12Hz",        "qwen-tts-tokenizer", "语音 · 编解码器（必需）"),
+    ("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+     "qwen-tts-custom", "语音 · 预设音色 + 风格指令"),
+    ("Qwen/Qwen3-TTS-12Hz-1.7B-Base", "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+     "qwen-tts-base", "语音 · 3 秒克隆"),
+    ("Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+     "qwen-tts-design", "语音 · 文字造音色"),
+    ("Qwen/Qwen3-TTS-Tokenizer-12Hz", "Qwen/Qwen3-TTS-Tokenizer-12Hz",
+     "qwen-tts-tokenizer", "语音 · 编解码器（必需）"),
 ]
 
-def download(repo, dest, label, only=None):
-    from huggingface_hub import snapshot_download
+def download(repo, ms_repo, dest, label, only=None):
+    """魔搭优先，HF 兜底。
+
+    为什么不统一走 HF：境内直连 huggingface.co 实测 **0.55 MB/s**，hf-mirror 0.46 MB/s，
+    90 GB 的 HyperFlow 一套要下 40 小时；魔搭单连接 **26 MB/s**，同样的量十几分钟。
+    两个源的白名单语义一致（fnmatch），所以 `only` 原样传。
+
+    换源是**整体重试**：一个包里混两个源，续传断一次就分不清哪个文件来自哪儿。
+    """
     print(f"\n── {label}\n   {repo} → {dest}", flush=True)
-    try:
-        p = snapshot_download(
-            repo_id=repo,
-            local_dir=dest,
-            allow_patterns=only,      # None = 整仓
-        )
-        print(f"   ✓ 就绪 {p}", flush=True)
-        return True
-    except Exception as e:
-        msg = f"{type(e).__name__}: {e}"
-        print(f"   ✗ 失败 {msg[:300]}", flush=True)
-        if "gated" in msg.lower() or "401" in msg or "403" in msg:
-            print("     → 这个仓库要在网页上先同意许可，再 `hf auth login`（填 Access Token）", flush=True)
-        return False
+    last = None
+    for src in ("ms", "hf"):
+        try:
+            if src == "ms":
+                if not ms_repo:
+                    raise RuntimeError("魔搭没有这个仓库")
+                from modelscope import snapshot_download as snap
+                p = snap(model_id=ms_repo, local_dir=dest, allow_patterns=only)
+            else:
+                from huggingface_hub import snapshot_download as snap
+                p = snap(repo_id=repo, local_dir=dest, allow_patterns=only)
+            print(f"   ✓ 就绪（{src}）{p}", flush=True)
+            return True
+        except Exception as e:
+            last = e
+            msg = f"{type(e).__name__}: {e}"
+            print(f"   · {src} 失败：{msg[:200]}", flush=True)
+    print(f"   ✗ 两个源都没下成：{last}", flush=True)
+    return False
 
 ok = fail = 0
-for key, repo, sub, label, only in PLAN:
+for key, repo, ms_repo, sub, label, only in PLAN:
     if not take(key):
         continue
     dest = os.path.join(root, sub or repo.split("/")[-1])
-    if download(repo, dest, label, only):
+    if download(repo, ms_repo, dest, label, only):
         ok += 1
     else:
         fail += 1
 
-# 分词器是按仓库内的 FL2VA/processor/* 取下来的，落盘会带上那层目录；
-# DiffSynth 认的是包目录下的 processor/，所以搬平一层，顺手清掉空壳。
-for base in (os.path.join(root, "MiniMax-H3-NF4"),):
-    src = os.path.join(base, "FL2VA", "processor")
-    dst = os.path.join(base, "processor")
-    if os.path.isdir(src) and not os.path.isdir(dst):
-        os.rename(src, dst)
-        try:
-            os.rmdir(os.path.join(base, "FL2VA"))
-        except OSError:
-            pass
-        print(f"   ✓ 分词器已归位 {dst}", flush=True)
-
 if take("voice"):
-    for repo, sub, label in VOICE:
-        if download(repo, os.path.join(vodir, sub), label):
+    for repo, ms_repo, sub, label in VOICE:
+        if download(repo, ms_repo, os.path.join(vodir, sub), label):
             ok += 1
         else:
             fail += 1
@@ -444,7 +505,7 @@ sys.exit(1 if fail else 0)
 PY
   local rc=$?
   if [ "$rc" = "0" ]; then
-    ok "模型下载完成。Vram 账本：图片 22G（共享）/ 视频 H3-NF4 34G（独占）"
+    ok "模型下载完成。Vram 账本：图片 31G（共享）/ 视频 HyperFlow 91G（主干 16 + 组件 74，独占）"
   else
     warn "有模型没下全。失败原因看上面；下完重跑：bash deploy/bootstrap.sh models $want"
   fi
@@ -620,7 +681,7 @@ case "${1:-help}" in
     say ""
     say "  install [--with-models] [--with-voice]   装环境"
     say "  models [all|image|video|text|voice]   预下载模型（按显存自动取舍，别用 all）"
-    say "  models video-full                    只在 ≥125 GB 显存的卡上用（官方 bf16 全量，171 GB）"
+    say "  models video                          HyperFlow H3 Flash（主干 16 GB + 组件 74 GB）"
     say "  start | stop | restart | status          启停 / 看状态"
     say "  autostart                                注册 systemd 开机自启（有 systemd 才有效）"
     ;;

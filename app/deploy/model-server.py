@@ -80,6 +80,46 @@ VIDEO_MODEL = _VIDEO_ENV or "MiniMaxAI/MiniMax-H3"
 # 「悄悄换了个模型出片」比「直接告诉我不够」有害得多。
 VIDEO_DEFAULT = os.environ.get("YJ_VIDEO_DEFAULT", "").strip() or VIDEO_MODEL
 VIDEO_BACKEND = os.environ.get("YJ_VIDEO_BACKEND", "auto")
+
+# ---- HyperFlow H3 Flash：云端默认视频档 ----
+#
+# 上游 MiniMax-H3 主干 31B / bf16 125 GB，48 GB 卡要开重 offload 才勉强跑，
+# 一条 5 秒片十分钟起步。HyperFlow H3 Flash 是它的**压缩少步版**（13.7B）：
+#   · 主干 INT8 convrot 16 GB（另有 GGUF 7.2–15.2 GB 一路，那条走 ComfyUI）；
+#   · 4 / 6 / 8 步、无 CFG（默认 6 步），4000 系卡上 5.2 s 片段 150 s 量级；
+#   · 一次前向同时出视频 + 32 kHz 立体声，省掉单独的音效 / 配音一趟；
+#   · 文本编码器、视频 VAE、音频 VAE 都复用 MiniMax-H3 仓库里的那几件。
+#
+# **权重分两处放**，缺一不可（这也是它和以前那两档最不一样的地方）：
+#   WEIGHTS  /root/models/hyperflow-h3-flash/fl2va_int8_convrot/   16 GB 主干
+#   BASE     /root/models/MiniMax-H3/                              63 GB 编码器 + VAE
+# 所以判据不能只看一个目录的体积 —— 见 `flash_ready()`。
+FLASH_DIR = Path(
+    os.environ.get("YJ_FLASH_DIR")
+    or (Path(os.environ.get("YJ_LOCAL_MODELS") or "/root/models") / "hyperflow-h3-flash")
+)
+# 组件目录（文本编码器 / 视频 VAE / 音频 VAE / tokenizer / processor）。
+#
+# 两个位置都认，顺序即优先级：
+#   ① `<FLASH_DIR>/MiniMax-H3/` —— 客户端下载器就是这么放的（一个包目录装全套，
+#      免得「主模型一个目录、组件另一个目录」在桌面端各处拷贝时散架）；
+#   ② `<models>/MiniMax-H3/`   —— 命令行 / 平台 UI 手工下的那份（也是 HyperFlow
+#      官方 CLI 的默认行为）。
+# 写死其中一条都会在另一种装法上判成「组件缺失」，而现象是「权重明明在、就是不出片」。
+FLASH_BASE = Path(
+    os.environ.get("YJ_FLASH_BASE")
+    or (Path(os.environ.get("YJ_LOCAL_MODELS") or "/root/models") / "MiniMax-H3")
+)
+# 主干 INT8 是 15.9 GB（3 个分片，十进制）。门槛取 15.0 GB：
+# 半截分片不能被判成 ready；也别按标称 16.2 卡死 —— 上游重新导出会挪动几十 MB。
+#
+# 单位是**十进制 GB**（`* 1e9`），和仓库文件清单里的 GB 同口径。
+# 用 `1024**3` 会把 15.9 GB 算成 14.8「GB」，门槛 15.0 反而判不过 ——
+# 这正是第一次接进来时 flash 报 ready=false 的原因，排查了半轮。
+FLASH_MIN_BYTES = int(float(os.environ.get("YJ_FLASH_MIN_GB", "15.0")) * 1e9)
+# 帧规则与上游一致：17n+5，124（5.17 s）到 362（15.08 s）。
+FLASH_MIN_FRAMES, FLASH_MAX_FRAMES = 124, 362
+
 IMAGE_STEPS = int(os.environ.get("YJ_IMAGE_STEPS", "28"))
 IMAGE_MAX_SIDE = int(os.environ.get("YJ_IMAGE_MAX_SIDE", "1536"))
 # 低显存档的出图长边。1024² 在 12 GB 卡上实测峰值 21 GB（激活值 + 注意力），
@@ -1111,6 +1151,15 @@ def _wan_worker_path():
     return str(ROOT / "wan_worker.py")
 
 
+def _flash_worker_path():
+    """HyperFlow H3 Flash 的 worker。同上：`.py` 优先，`.pyc` 兜底。"""
+    for name in ("flash_worker.py", "flash_worker.pyc"):
+        p = ROOT / name
+        if p.is_file():
+            return str(p)
+    return str(ROOT / "flash_worker.py")
+
+
 VIDEO_LONG_SIDE = {"480p": 832, "720p": 1344, "1080p": 1920, "1440p": 2560}
 
 # 尾帧能不能吃，取决于 worker 走哪条路线：
@@ -1194,14 +1243,21 @@ def _submit_video_locked(body):
         # 直说「权重没齐」比让 diffusers 抛一个认不出目录的错好查得多。
         # 配置检测里那行「下载中 x%」才是用户该看的东西。
         got = _dir_bytes(_v) / 1024 ** 3 if os.path.isdir(_v) else 0
+        need = VIDEO_MIN_BYTES / 1024 ** 3
         raise RuntimeError(
-            f"视频权重未就绪：{_v or '未找到'} 现有 {got:.1f} GB，需要 {VIDEO_MIN_BYTES / 1024 ** 3:.1f} GB"
+            f"视频权重未就绪：{_v or '未找到'} 现有 {got:.1f} GB，需要 {need:.1f} GB"
             "（在「模型配置」里把视频模型下完，或 bash deploy/bootstrap.sh models video）"
         )
     alias = {
         "h3": _v, "minimax": _v, "minimax-h3": _v,
         "minimax-h3-base": _v, "h3-base": _v, "video": _v,
     }
+    # HyperFlow 档的别名。画布下拉里写的是 `hyperflow-h3-flash`，
+    # 这个名字必须能落到本地那份权重上，否则选了它只会报「权重未就绪」。
+    flash_home = flash_dir()
+    if flash_home:
+        for k in ("hyperflow", "hyperflow-h3-flash", "h3-flash", "h3flash", "flash"):
+            alias[k] = flash_home
     # 小模型档的别名：画布下拉里写的是 `wan2.2-ti2v-5b`，
     # 这个名字必须能落到本地那份 GGUF 目录上，否则选了它只会报「权重未就绪」。
     if small_video_dir():
@@ -1209,10 +1265,20 @@ def _submit_video_locked(body):
             alias[k] = small_video_dir()
     model = _resolve_repo(body.get("model"), _v or VIDEO_DEFAULT, alias)
 
-    # 走哪条 worker：小模型档是纯 diffusers + GGUF（Wan），其余是 H3 那套
+    # 走哪条 worker：三条路线的帧规则、加载方式和产物封装都不一样。
+    #   flash  —— HyperFlow H3 Flash（INT8 主干 + MiniMax-H3 组件，音画同出）
+    #   small  —— Wan2.2-TI2V-5B + GGUF（12 GB 消费卡）
+    #   其余   —— H3-NF4 / DiffSynth
     small = _is_small(model)
+    flash = _is_flash(model)
+    if flash:
+        worker = _flash_worker_path()
+    elif small:
+        worker = _wan_worker_path()
+    else:
+        worker = _worker_path()
     args = [
-        sys.executable, _wan_worker_path() if small else _worker_path(),
+        sys.executable, worker,
         "--job", job_id, "--status", str(status_file), "--out", str(OUT),
         "--port", str(PORT), "--model", model,
         "--prompt", body.get("prompt") or "",
@@ -1222,6 +1288,12 @@ def _submit_video_locked(body):
         "--variant", str(body.get("variant") or "auto"),
         "--steps", str(body.get("steps") or 0),
     ]
+    if flash:
+        # 组件目录必须显式给：worker 自己扫盘时认的是 env 与 /root/models 下的固定名，
+        # 而 www 面板可能把它下到了别处（YJ_FLASH_BASE）。服务端知道就直说。
+        args += ["--base-model", flash_ready()[1]]
+        if body.get("offload"):
+            args += ["--offload", str(body["offload"])]
     if small:
         # 显式给 GGUF 路径：目录里可能同时存在多个量化档，选哪个由服务端决定，
         # 不让 worker 自己猜（猜错就是「加载了 Q2、画面糊成一片」这种无声降质）。
@@ -1286,6 +1358,17 @@ def _submit_video_locked(body):
         max_dur = 121 / 24.0
         if want_dur > max_dur + 0.01:
             clamped["durationSec"] = {"want": want_dur, "max": round(max_dur, 2)}
+    elif flash:
+        # HyperFlow 的帧规则是 `17n + 5`，能落在 124（5.17 s）到 362（15.08 s）之间。
+        # 请求短于下限会被**抬**到 124 帧（训练下限，少给帧会直接崩结构），
+        # 长于上限会被压到 362。两个方向都得回话 —— 用户拖了 3 秒拿回 5.2 秒，
+        # 不说清楚就是「时长参数没生效」。
+        want_dur = float(body.get("duration") or body.get("seconds") or 5)
+        lo, hi = FLASH_MIN_FRAMES / 24.0, FLASH_MAX_FRAMES / 24.0
+        if want_dur < lo - 0.01:
+            clamped["durationSec"] = {"want": want_dur, "min": round(lo, 2)}
+        elif want_dur > hi + 0.01:
+            clamped["durationSec"] = {"want": want_dur, "max": round(hi, 2)}
     size_want = str(body.get("size") or "")
     if small and size_want:
         try:
@@ -1294,6 +1377,15 @@ def _submit_video_locked(body):
             # 12 GB 卡上长边超过 1216 就要顶穿显存预算（vram_guard 会直接 OOM）
             if long_side > 1216:
                 clamped["resolution"] = {"want": size_want, "max": "1216"}
+        except Exception:
+            pass
+    if flash and size_want:
+        try:
+            w, h = [int(float(x)) for x in size_want.lower().replace("*", "x").split("x")]
+            # 画布是「短边 768 + 32 对齐 + 上限 768×1344」；超出这个盒子的请求
+            # 会被 worker 按比例收进来（不是拉伸），所以这里按盒子报回去。
+            if min(w, h) > 768 or max(w, h) > 1344:
+                clamped["resolution"] = {"want": size_want, "max": "1344x768 (短边 768)"}
         except Exception:
             pass
 
@@ -1330,30 +1422,63 @@ def proxy_json(path, body, timeout=600):
 
 
 def proxy_stream(handler, path, body):
-    """把上游的 SSE 原样泼回去。不要自己解包再拼 —— 中间加一层就会丢 tool_calls 增量。"""
+    """把上游的 SSE 原样泼回去。不要自己解包再拼 —— 中间加一层就会丢 tool_calls 增量。
+
+    这里有三件事必须自己管，缺一件前端就会「说一半卡住一直等」：
+
+    1. **应答体要有结束标记**。SSE 没有 Content-Length，也不用 chunked，
+       HTTP/1.1 下客户端只能靠连接关闭判断结束；BaseHTTPRequestHandler 默认
+       keep-alive，do_POST 返回后连接不关 ⇒ 客户端收完 [DONE] 还在等下一个字节。
+    2. **别先发 200 再连上游**。上游没起来时先发 200 等于把错误藏起来，
+       前端只能拿到一个空流。
+    3. **读的时候用 read1**。`HTTPResponse.read(n)` 会一直攒够 n 字节才返回，
+       SSE 分片只有一两百字节，攒满 4 KB 才出头一次 ⇒ 首字白白慢好几秒。
+    """
     req = urllib.request.Request(
         f"{TEXT_UPSTREAM}{path}",
         data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
         method="POST",
     )
+    try:
+        upstream = urllib.request.urlopen(req, timeout=900)
+    except Exception as e:  # noqa: BLE001
+        # 上游连不上：还能好好回一个 HTTP 错误码，比「200 + 空流」好排障得多
+        payload = json.dumps({"error": f"文本服务连不上：{e}"}, ensure_ascii=False).encode("utf-8")
+        handler.send_response(502)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.wfile.write(payload)
+        handler.close_connection = True
+        return
+
     handler.send_response(200)
     handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
     handler.send_header("Cache-Control", "no-cache")
     handler.send_header("X-Accel-Buffering", "no")
+    handler.send_header("Connection", "close")
     handler.end_headers()
+    handler.close_connection = True
+
+    read_some = getattr(upstream, "read1", None) or upstream.read
     try:
-        with urllib.request.urlopen(req, timeout=900) as r:
+        with upstream:
             while True:
-                chunk = r.read(4096)
+                chunk = read_some(4096)
                 if not chunk:
                     break
                 handler.wfile.write(chunk)
                 handler.wfile.flush()
-    except Exception as e:
-        payload = json.dumps({"error": str(e)}).encode()
-        handler.wfile.write(b"data: " + payload + b"\n\n")
-        handler.wfile.flush()
+    except Exception as e:  # noqa: BLE001
+        # 连接已经半死，除了补一条 SSE 错误帧也没别的可做
+        try:
+            payload = json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8")
+            handler.wfile.write(b"data: " + payload + b"\n\n")
+            handler.wfile.flush()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def proxy_voice(handler, body):
@@ -1403,6 +1528,14 @@ def _has_weights(path_str):
         if not p.is_dir():
             return False
         if (p / "model_index.json").is_file() or (p / "configuration.json").is_file():
+            # 排除「只有组件、没有主干」的目录。
+            #
+            # HyperFlow 的组件库就是 MiniMax-H3 原仓（text_encoder / vae / audio_vae …），
+            # 我们**没有**下它那个 66 GB 的 transformer。这种目录 73 GB、入口文件也在，
+            # 按体积判会一路通过，于是 video 报 ready —— 但交给 DiffSynth 只会
+            # `找不到 transformer`。判据要落在「有没有主干」上。
+            if (p / "modular_model_index.json").is_file() and not (p / "transformer").is_dir():
+                return False
             return True
         # H3 官方 diffusers 仓库：入口在 FL2VA 分区里
         return (p / "FL2VA" / "model_index.json").is_file()
@@ -1453,11 +1586,29 @@ def _video_ready(p: str) -> bool:
     低显存小模型档例外：它是 GGUF 量化权重，本来就只有 3–4 GB，
     按 H3 的 29.2 GB 体积门槛判会把「装好了」判成「没装」——
     又是一次「拿别人的规格当自己的判据」。这一档只看组件齐不齐。
+    HyperFlow 档同理（主干 16 GB + 组件 63 GB，且分散在两个目录），
+    它的判据由 `flash_ready()` 单独负责。
     """
     small = small_video_dir()
     if small and os.path.abspath(str(p)) == os.path.abspath(small):
         return True
+    if _is_flash(p):
+        return True
     return _has_weights(p) and _dir_bytes(str(p), VIDEO_MIN_BYTES) >= VIDEO_MIN_BYTES
+
+
+def _vram_gb() -> float:
+    """本机最大一张卡的显存（GB）。取不到算 0 —— 判档位时才用，不影响可用性。"""
+    try:
+        import torch  # noqa: PLC0415
+
+        if not torch.cuda.is_available():
+            return 0.0
+        return max(
+            torch.cuda.get_device_properties(i).total_memory for i in range(torch.cuda.device_count())
+        ) / 1024 ** 3
+    except Exception:
+        return 0.0
 
 
 # ============================================================== 低显存小模型档
@@ -1583,6 +1734,79 @@ def _is_small(p) -> bool:
     return any(ap == os.path.abspath(x) for x in (small_video_dir(), small_image_dir()) if x)
 
 
+# ---------------------------------------------------------------- HyperFlow H3 Flash
+#
+# 判据是**两处都在**，不是「某个目录够大」：
+#   ① 主干：`<FLASH_DIR>/fl2va_int8_convrot/config.json` + 三个分片合计 ≥ 15 GB
+#   ② 组件：`<FLASH_BASE>/modular_model_index.json` + text_encoder / vae / audio_vae
+# 只看①会在「编码器没下完」时报 ready（上游首次运行才去拉 63 GB），
+# 用户点生成、等十分钟、拿到一个 `did not load` —— 又是一次假绿。
+def _flash_partition(d: Path) -> Path | None:
+    """主干分区：带 config.json 的那一层。允许直接把分区目录当权重根传进来。"""
+    try:
+        if (d / "config.json").is_file():
+            return d
+        for sub in ("fl2va_int8_convrot", "fl2va_int8_convrot_comfyui"):
+            if (d / sub / "config.json").is_file():
+                return d / sub
+    except OSError:
+        pass
+    return None
+
+
+def _flash_base_ok(d: Path) -> tuple[bool, str]:
+    """MiniMax-H3 侧组件齐不齐。返回 (ok, 缺的那件)。"""
+    try:
+        if not (d / "modular_model_index.json").is_file():
+            return False, "modular_model_index.json"
+        for part in ("text_encoder", "vae", "audio_vae"):
+            if not (d / part).is_dir():
+                return False, part
+    except OSError as e:
+        return False, repr(e)
+    return True, ""
+
+
+def _flash_base_candidates() -> list[Path]:
+    """组件目录候选，顺序即优先级（env → 包内 → 同级）。"""
+    out: list[Path] = []
+    env = os.environ.get("YJ_FLASH_BASE", "").strip()
+    if env:
+        out.append(Path(env))
+    out.append(FLASH_DIR / "MiniMax-H3")
+    out.append(FLASH_BASE)
+    return out
+
+
+def flash_ready() -> tuple[str, str]:
+    """(主干权重根, 组件目录)。任一不齐就返回空串 —— 真看文件，不看标记。"""
+    part = _flash_partition(FLASH_DIR)
+    if part is None:
+        return "", ""
+    if _dir_bytes(str(part), FLASH_MIN_BYTES) < FLASH_MIN_BYTES:
+        return "", ""
+    for cand in _flash_base_candidates():
+        ok, _missing = _flash_base_ok(cand)
+        if ok:
+            return str(FLASH_DIR), str(cand)
+    return "", ""
+
+
+def flash_dir() -> str:
+    return flash_ready()[0]
+
+
+def _is_flash(p) -> bool:
+    """这个路径是不是 HyperFlow 档（用来分叉 worker / 帧规则 / offload 口径）。"""
+    if not p:
+        return False
+    root = flash_dir()
+    if not root:
+        return False
+    ap, ar = os.path.abspath(str(p)), os.path.abspath(root)
+    return ap == ar or ap.startswith(ar + os.sep)
+
+
 def _scan_video_dirs():
     """按 `run.sh pick_video` 的判据扫盘，返回第一个**能加载**的视频权重目录。"""
     for base in (
@@ -1606,9 +1830,25 @@ def _scan_video_dirs():
 
 
 def video_model():
-    """当前该用的视频权重：env 有效就用 env，否则小显存档，再否则现扫一遍盘。"""
+    """当前该用的视频权重。
+
+    优先级（每一档都先验「真能加载」）：
+      1. env `YJ_VIDEO_MODEL` 指的目录 —— 用户显式指定就照办；
+      2. **HyperFlow H3 Flash**（本机显存 ≥ 24 GB 且有这份权重时作默认）；
+      3. 低显存小档（Wan2.2 GGUF）；
+      4. 现扫一遍盘上的 MiniMax-H3；
+      5. 都没有 —— 返回仓库 id，让上层明确报「未就绪」。
+
+    第 2 档压在第 3 档前面是因为「装了哪份就用哪份」在这两档上会打架：
+    48 GB 的机器上两份都装得下，此时用户要的是画质和音画同出，不是省显存。
+    反过来 12 GB 的机器上 flash 那份本来就装不下也不会被判 ready，
+    所以门槛用显存兜一道，而不是靠目录名猜。
+    """
     if _video_ready(VIDEO_MODEL):
         return VIDEO_MODEL
+    flash = flash_dir()
+    if flash and _vram_gb() >= 24:
+        return flash
     small = small_video_dir()
     if small:
         return small
@@ -1673,6 +1913,18 @@ class Handler(BaseHTTPRequestHandler):
                     "image_offload": IMAGE_OFFLOAD,
                     "video": video_model(),
                     "video_default": video_model() or VIDEO_DEFAULT,
+                    # 三档视频各自以为准的状态：面板据此显示「装了哪几份 / 缺哪件」，
+                    # 不用去猜目录名（以前面板显示的名字和引擎实际读的不是一个）。
+                    "video_tiers": {
+                        "flash": {
+                            "ready": bool(flash_dir()),
+                            "weights": flash_dir(),
+                            "base": flash_ready()[1],
+                            "frames": [FLASH_MIN_FRAMES, FLASH_MAX_FRAMES],
+                        },
+                        "wan": {"ready": bool(small_video_dir()), "dir": small_video_dir()},
+                        "h3": {"ready": _has_weights(VIDEO_MODEL), "dir": VIDEO_MODEL},
+                    },
                 },
             })
 
@@ -1682,6 +1934,7 @@ class Handler(BaseHTTPRequestHandler):
             # 客户端据此决定「这台机器上到底有哪些模型可选」——
             # 列一堆装不上的名字，用户选中后必然失败（以前就是这样）。
             smallv = _is_small(video_model())
+            flashv = _is_flash(video_model())
             img_models = []
             # 低显存档排在前面 = 默认选中它。它装了就一定比 2.1 更适合这台机器：
             # 2.1 要 22 GB 内存，装得下不代表跑得动。
@@ -1691,17 +1944,24 @@ class Handler(BaseHTTPRequestHandler):
                      "owned_by": "local", "kind": "image"}
                 )
             if small_image_dir() or _has_weights(IMAGE_MODEL):
+                # 这里只暴露**别名**，不要把权重路径当模型名。
+                # 之前全量版直接给 IMAGE_MODEL（`/root/models/Qwen-Image-2.1`），
+                # 于是画布的模型下拉和生成回执里挂着一串文件系统路径 ——
+                # 用户看不懂，换台机器装到别的目录又会变成另一个名字。
+                # `_resolve_repo()` 对不带 `/` 的名字会收敛到默认权重，别名照样能出图。
                 img_models.append(
-                    {"id": "qwen-image-2.1" if small_image_dir() else IMAGE_MODEL,
-                     "object": "model", "owned_by": "local", "kind": "image"}
+                    {"id": "qwen-image-2.1", "object": "model",
+                     "owned_by": "local", "kind": "image"}
                 )
             return self._json(200, {
                 "object": "list",
                 "data": [
                     *img_models,
-                    {"id": "wan2.2-ti2v-5b" if smallv else "minimax-h3",
+                    {"id": ("hyperflow-h3-flash" if flashv
+                            else "wan2.2-ti2v-5b" if smallv
+                            else "minimax-h3"),
                      "object": "model", "owned_by": "local", "kind": "video"},
-                    {"id": os.environ.get("YJ_TEXT_MODEL", "Qwen3-8B-Instruct"),
+                    {"id": os.environ.get("YJ_TEXT_NAME", "qwen3-8b"),
                      "object": "model", "owned_by": "local", "kind": "chat"},
                 ],
             })
@@ -1878,6 +2138,12 @@ def main():
             f"长边 {_side}px / offload={IMAGE_OFFLOAD}）"
         )
     log(f"视频 {video_model() or '未安装（权重装了会自动生效，不用重启）'}（backend={VIDEO_BACKEND}）")
+    _fdir = flash_dir()
+    if _fdir:
+        log(f"     HyperFlow H3 Flash 可用（默认档 / 6 步 / 音画同出 / 124–362 帧 / 组件 {flash_ready()[1]}）")
+    _sdir = small_video_dir()
+    if _sdir and not _is_flash(video_model()):
+        log(f"     Wan2.2-TI2V-5B 低显存档也可用（{_sdir}）")
     LEASE.start_idle_watcher()
     _warm_translator()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
